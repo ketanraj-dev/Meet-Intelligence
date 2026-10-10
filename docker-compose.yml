@@ -1,0 +1,91 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-meet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meet}
+      POSTGRES_DB: ${POSTGRES_DB:-meet_intelligence}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meet}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local S3-compatible storage. MinIO's own image now requires a paid Docker Hub
+  # subscription to pull, so we use Zenko CloudServer here instead (free, same S3
+  # API). Prod can point MINIO_ENDPOINT/keys at real MinIO, S3, or R2 unchanged.
+  storage:
+    image: zenko/cloudserver:latest
+    environment:
+      SCALITY_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-accessKey1}
+      SCALITY_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-verySecretKey1}
+    ports:
+      - "9000:8000"
+    volumes:
+      - minio_data:/usr/src/app/localData
+      - ./docker/zenko-config.json:/usr/src/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8000/_/healthcheck', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-meet}:${POSTGRES_PASSWORD:-meet}@postgres:5432/${POSTGRES_DB:-meet_intelligence}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: storage:8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: >
+      sh -c "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # Calendar poller + bot-pool reaper. Phase 2 extends this same process to also
+  # launch bot containers at scheduled_at - 60s.
+  scheduler:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-meet}:${POSTGRES_PASSWORD:-meet}@postgres:5432/${POSTGRES_DB:-meet_intelligence}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: storage:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+      - ./secrets:/app/secrets:ro
+    command: python -m scheduler.main
+
+volumes:
+  postgres_data:
+  minio_data:

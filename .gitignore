@@ -1,0 +1,11 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+chrome-profile/
+recordings/
+secrets/
+bot-profiles/
+oauth_token.json
