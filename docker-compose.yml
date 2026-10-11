@@ -67,8 +67,11 @@ services:
     command: >
       sh -c "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
 
-  # Calendar poller + bot-pool reaper. Phase 2 extends this same process to also
-  # launch bot containers at scheduled_at - 60s.
+  # Calendar poller + bot-pool reaper + bot-launcher. The launcher needs the
+  # host's docker.sock (to start sibling bot containers — see
+  # scheduler/bot_launcher.py's module docstring on why bind-mount paths
+  # must be given in HOST terms) and HOST_PROJECT_DIR set to this repo's
+  # absolute path on the host for that reason.
   scheduler:
     build:
       context: .
@@ -84,7 +87,41 @@ services:
     volumes:
       - ./:/app
       - ./secrets:/app/secrets:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     command: python -m scheduler.main
+
+  # Not started by `docker compose up` (profiles: manual) — built so its image
+  # exists for the scheduler's bot-launcher to reference, and runnable by hand
+  # for testing via `docker compose run --rm bot ...` (see README Phase 2).
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    profiles: ["manual"]
+    # Docker's default /dev/shm is 64MB, way too small for Chromium — causes
+    # "Aw, Snap!" tab crashes. --disable-dev-shm-usage (below, in bot.py) is a
+    # fallback; this is the real fix. Mirrored in scheduler/bot_launcher.py's
+    # containers.run() for bots launched automatically.
+    shm_size: "2gb"
+    # Give the SIGTERM handler time to leave the call, stop ffmpeg, and
+    # upload the recording before Docker SIGKILLs. Mirrored by
+    # stop_timeout in scheduler/bot_launcher.py for auto-launched bots.
+    stop_grace_period: 30s
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-meet}:${POSTGRES_PASSWORD:-meet}@postgres:5432/${POSTGRES_DB:-meet_intelligence}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: storage:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    volumes:
+      - ./bot-profiles:/bot-profiles
+      - ./recordings:/recordings
 
 volumes:
   postgres_data:

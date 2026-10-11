@@ -438,3 +438,359 @@ service account reading/editing **employee** calendars; bot identity is unrelate
    Worth deciding the bot's actual launch-lead-time (distinct from the reservation
    window) when we design the scheduler in Phase 2 — not changing anything now since
    it's not this change request's scope.
+
+---
+
+## Phase 2 — The meeting bot
+
+**What's built:**
+- `bot/` — the meeting bot container: `Dockerfile`, `entrypoint.sh`, `bot.py`,
+  `selectors.yaml`, `requirements.txt`.
+- `bot/bot.py` has two modes:
+  - `BOT_MODE=login` — one-time interactive setup. Launches a **plain Chromium
+    subprocess — not via Playwright** — against the persistent profile dir, plus a VNC
+    server (port 5900) so you can log the bot's Gmail account in by hand; stays up
+    until stopped, which terminates the process cleanly so the session is flushed to
+    disk. No DB calls. See "Google blocks Playwright-driven sign-in" below for why this
+    isn't just `launch_persistent_context`.
+  - `BOT_MODE=run` (default) — the actual bot: `checkout_or_mark_unavailable` from the
+    pool (still gates concurrency either way) → `status=joining` → launches Chromium
+    (`BOT_JOIN_MODE=guest`, the default: a fresh temp profile, types the display name
+    into Meet's "Your name" field — permitted since the Workspace Meet "Domain" setting
+    allows non-signed-in users; `BOT_JOIN_MODE=signed_in`: the account's saved
+    persistent profile instead) → `Ask to join` (the **normal** path either way, since
+    even signed-in bot accounts are external Gmail, not `fincelerate.com` members) →
+    waits for admission with a timeout → `status=in_call` on success, `bot_rejected` on
+    timeout/denial → posts the consent chat message → polls participant count every
+    250ms into `speakers.jsonl` → leaves when alone 60s, removed, max duration, **or a
+    SIGTERM/SIGINT** → uploads whatever audio + speaker log exists → `status=recorded`
+    → enqueues processing → releases the account immediately.
+- **Audio**: ffmpeg records `meet_sink.monitor` (whatever Chrome plays to the PulseAudio
+  null sink set as default) as 16kHz mono WAV, segmented every
+  `audio_segment_seconds` (default 300s) so a crash never loses the whole call.
+  **`audio_key` on `meetings` is a storage key *prefix*** (`meetings/<id>/audio/`), not
+  a single object — there can be multiple segment files. Phase 3's diarization needs to
+  list/concatenate under that prefix, not fetch one key.
+- **Chrome choice**: Playwright's bundled **Chromium**, not Google Chrome — Chrome ships
+  amd64-only (no arm64 build), Chromium has native arm64 builds, and Meet doesn't need
+  anything Chrome-only for basic audio/video. Confirmed while building this: the image
+  built and ran natively on this Apple Silicon host with no emulation warning (unlike
+  `zenko/cloudserver` back in Phase 1).
+- `bot_pool` wiring: `checkout_or_mark_unavailable` at start, a background thread
+  calling `heartbeat` every `BOT_HEARTBEAT_INTERVAL_SECONDS`, `release_account` on every
+  exit path (success, rejection, crash).
+- `common/queue.py` — `enqueue_processing(meeting_id)`, a plain Redis list push.
+  Phase 3 adds the real consumer; for now it just accumulates so nothing's lost.
+- **Scheduler's bot-launch loop** (`scheduler/bot_launcher.py`, third thread in
+  `scheduler/main.py`): every 15s, atomically flips `scheduled → joining` for meetings
+  due within `BOT_LAUNCH_LEAD_SECONDS` (default 60s) and launches one bot container per
+  meeting via the `docker` SDK. This is **docker-outside-of-docker**: the scheduler
+  container launches *sibling* containers through the mounted host `docker.sock`, so
+  bind-mount paths must be given in **host** terms — hence `HOST_PROJECT_DIR` (now set
+  in `.env` to this repo's real absolute path on this machine).
+- `login` setup mode (above) satisfies the "log the account in once, viewable via VNC"
+  requirement from Phase 1's bot-account-setup doc.
+
+**Deviations / judgment calls worth knowing about:**
+- The bot does its **own** account checkout on startup (not the scheduler pre-selecting
+  one and passing it in) — simpler, works identically whether launched by the scheduler
+  or run by hand with just `MEETING_ID`, and `checkout_account`'s SKIP LOCKED semantics
+  make this just as safe as a scheduler-side checkout would be.
+- `docker.sock` is mounted into the `scheduler` container so it can launch bot
+  containers — this gives that container full Docker API access (equivalent to root on
+  the host). Fine at this stage; flagging as a real Phase 7 hardening item (e.g. a
+  socket proxy restricting the API surface to just `containers.run`).
+- The `bot-launcher` assumes a single-host Docker Compose deployment (it launches
+  containers on *the* Docker daemon it can reach via the mounted socket). Moving to
+  multiple hosts/Swarm/k8s later would need this rewritten — not a concern yet.
+- `page.click(...)` calls throughout `bot.py` swallow failures and log a warning rather
+  than crashing, **except** the two "ask to join"/"join now" buttons, where failing both
+  raises — a pre-join toggle or a missing name field failing shouldn't abort the whole
+  join; not finding any way to actually join should.
+
+**Google blocks Playwright-driven sign-in ("This browser or app may not be secure")**:
+hit this live on the first real login attempt. `launch_persistent_context` always
+attaches the Chrome DevTools Protocol and sets `navigator.webdriver = true` — Google's
+login flow actively fingerprints both and blocks sign-in, and there's no Playwright API
+to suppress it (CDP attachment is the whole point of Playwright). Fix: `run_login_mode`
+no longer touches Playwright's `launch()` at all. It reads `pw.chromium.executable_path`
+(just a path lookup, doesn't launch anything) to find the Chromium binary Playwright
+already downloaded, then launches *that same binary* directly via `subprocess.Popen`
+with only `--user-data-dir`, `--no-sandbox` (needed since the container runs as root;
+unrelated to automation detection), `--no-first-run`, `--no-default-browser-check`, and
+a window size/position — no CDP, no `--enable-automation`, nothing Google's check keys
+off. Verified the actual running process's command line via `/proc/<pid>/cmdline` has
+none of `--enable-automation`/`--remote-debugging-port`/`--remote-debugging-pipe`
+anywhere in the whole process tree. `BOT_MODE=run` is untouched and still uses
+Playwright normally — Google's check blocks the interactive *sign-in* flow itself, not
+an already-authenticated session being driven later, which is a meaningfully different
+signal (session cookies vs. live CDP attachment during credential entry).
+
+**Chromium tab crashes ("Aw, Snap!") in both modes** — also hit live, during the login
+mode test above. Cause: Docker's default `/dev/shm` is 64MB; Chromium wants much more
+shared memory for its tabs and crashes the renderer when it can't get it. Two-part fix,
+applied to both modes:
+- **The real fix**: `shm_size: "2gb"` on the `bot` service in `docker-compose.yml`, and
+  `shm_size="2g"` passed to `client.containers.run(...)` in `scheduler/bot_launcher.py`
+  (manually-run and scheduler-launched bots were two separate code paths that both
+  needed it — compose's `shm_size:` doesn't apply to containers docker-py launches
+  directly). Verified `df -h /dev/shm` inside a rebuilt container now shows 2.0G
+  instead of 64M.
+- **Fallback**: `--disable-dev-shm-usage` (Chromium falls back to `/tmp` for shared
+  memory) on both the plain-subprocess login-mode launch and the Playwright
+  `launch_persistent_context` args in run mode. Verified present on the actual running
+  process via `/proc/<pid>/cmdline`.
+- **Run mode now explicitly handles a page crash as a failure** rather than risking a
+  silent half-dead state: `page.on("crash", ...)` logs a `page_crashed` error (with a
+  hint pointing at `/dev/shm`) and sets a flag that `_wait_for_admission` and
+  `_monitor_call` both check every loop iteration, raising `PageCrashed` — caught by its
+  own `except` branch in `run_bot_mode`, setting `status=failed` with a clear error
+  message. This matters because a crashed page's "Leave call" button also disappears,
+  which the monitor loop would otherwise misread as a normal `removed_or_left` — the
+  crash check runs first specifically to avoid that misclassification.
+
+**Guest join mode (`BOT_JOIN_MODE=guest`, now the default)**: joins with a fresh
+`tempfile.mkdtemp()` profile instead of the pool account's saved one — no Google
+sign-in at all, just the "Your name" field on Meet's pre-join screen (already in
+`selectors.yaml` as `pre_join.name_input`, reused as-is). The temp dir is cleaned up
+(`shutil.rmtree`) in a `finally` that wraps every exit path, success or failure. The
+bot pool is still checked out/released exactly as before — concurrency control doesn't
+care which join mode is active, only the *browser profile* differs.
+`AUTO_ADD_BOT_GUEST` is now gated on `bot_join_mode == "signed_in"` too (see
+`calendar_sync/sync.py:_auto_add_bot_guest_enabled`), **on top of** its own env flag —
+inviting a Gmail address as a calendar guest makes no sense when the bot never
+actually signs in as that address. Your `.env` still has `AUTO_ADD_BOT_GUEST=true` from
+before; it's simply inert now unless you switch to `signed_in`, since `guest` is the
+new default — confirmed live (`_auto_add_bot_guest_enabled(get_settings())` → `False`
+against your real `.env`).
+
+**Reduced automation signals in run mode**: `launch_persistent_context` now passes
+`ignore_default_args=["--enable-automation"]`, `args=["--disable-blink-features=
+AutomationControlled"]`, and a normal desktop `user_agent` (`BOT_USER_AGENT`). Verified
+on the live process's `/proc/<pid>/cmdline`: `--enable-automation` is absent and
+`--disable-blink-features=AutomationControlled` is present. One thing this does
+*not* remove, and can't: `--remote-debugging-pipe` (Playwright's actual CDP transport)
+is still there — there's no way to drive a browser via Playwright without some CDP
+channel, and that's fine, because it's a separate signal from what this was asked to
+address. `--enable-automation` drives Chrome's own "being controlled by automated test
+software" infobar and `navigator.webdriver`/`AutomationControlled`-gated JS behavior —
+the things a page's own JavaScript can actually detect. The CDP pipe itself is a
+driver-process IPC channel, invisible to page JS. This matters most for
+`BOT_JOIN_MODE=signed_in`, where an already-authenticated Google account is what's at
+stake if it gets flagged as bot-driven; applied to both join modes regardless since
+it's harmless either way.
+
+**SIGTERM/SIGINT now leave gracefully instead of getting SIGKILLed mid-call** — the gap
+flagged at the end of the previous round. `run_bot_mode` registers handlers for both
+signals that set a `shutdown_requested` flag; `_wait_for_admission` and `_monitor_call`
+check it every loop iteration (same pattern as the crash flag), and `_monitor_call`
+additionally attempts a best-effort click on "Leave call" before raising
+`GracefulShutdown` — so the host sees a normal departure, not the bot just vanishing.
+That exception is caught by its own branch that calls `_finalize_and_release` — the
+*same* success-path helper used for a normal leave (stop ffmpeg, upload whatever
+exists, `status=recorded`, release the account immediately) — not the failure path,
+since a deliberate shutdown with a partial recording isn't a bot malfunction.
+`docker-compose.yml`'s `bot` service got `stop_grace_period: 30s`, and
+`scheduler/bot_launcher.py` passes the equivalent `stop_timeout=settings.
+bot_stop_timeout_seconds` to `containers.run(...)` — both needed, same two-launch-path
+reasoning as the `shm_size` fix.
+
+**Found while wiring that env var through, not something you asked for**: the
+scheduler's `containers.run(...)` call only ever passed a hand-picked handful of env
+vars (`DATABASE_URL`, `REDIS_URL`, the `MINIO_*` ones, `LOG_LEVEL`) to auto-launched
+bots — and those containers have no `.env` file at all (no bind-mounted repo, no
+`env_file:`, unlike the manually-run `bot` service which gets the whole file via
+`env_file: .env`). So `BOT_JOIN_MODE`, `BOT_DISPLAY_NAME`, every timeout, the new
+`BOT_USER_AGENT` — all of it — would have silently fallen back to hardcoded Python
+defaults for scheduler-launched bots while manually-run ones correctly picked up
+`.env`, a real behavior split between the two launch paths that neither of us would've
+noticed until a production bot behaved differently from local testing. Fixed by
+replacing the hand-picked dict with `_bot_environment()`, which passes every `Settings`
+field through as `FIELD_NAME: str(value)` — verified it produces 43 env vars including
+`BOT_JOIN_MODE=guest`, where the old dict would have produced none of the new ones.
+
+**What's verified vs. not — be clear-eyed about this:**
+- **Verified live**, in this environment: the image builds and runs natively on arm64;
+  `BOT_MODE=login` starts Xvfb/PulseAudio/dbus/x11vnc and a plain (non-Playwright)
+  Chromium correctly (checked via `/proc/*/comm` and `/proc/*/cmdline` since the slim
+  image has no `ps`) — confirmed zero automation flags anywhere in the process tree —
+  and the VNC port actually accepts connections; stopping the container terminates
+  Chromium cleanly and the profile directory persists real Chrome data to the host
+  bind mount. Separately, `BOT_MODE=run` against a real meeting row with a **fake**
+  Meet URL
+  correctly checks out an account, starts ffmpeg (confirmed a valid 16kHz mono WAV was
+  produced via `file`), fails cleanly with a clear error when no join button is found,
+  sets `status=failed`, and releases the account back to `free` — the full mechanical
+  pipeline (DB wiring, process management, error handling, cleanup) works. `/dev/shm`
+  confirmed at 2.0G post-fix (was 64M), and `--disable-dev-shm-usage` confirmed present
+  on the live process in both modes. **This round, also verified live**: guest mode's
+  temp profile actually gets used (`--user-data-dir=/tmp/bot-guest-...` on the live
+  process, not `/bot-profiles/...`); `--enable-automation` is absent and
+  `--disable-blink-features=AutomationControlled` is present on the live run-mode
+  process; `_bot_environment()` produces the expected 43-var env dict against the real
+  `.env`, including `BOT_JOIN_MODE=guest`; `_auto_add_bot_guest_enabled()` correctly
+  returns `False` against the real `.env` despite `AUTO_ADD_BOT_GUEST=true` there.
+- **Tested via fakes, not live**: the `GracefulShutdown`/`PageCrashed` control flow
+  inside `_wait_for_admission`/`_monitor_call` (11 unit tests against a fake
+  Playwright-`Page`-like object — can't reach these code paths live without a real
+  admitted call, same root cause as the DOM-interaction gap below). I did confirm live
+  that signal registration/delivery itself works in this container (proven by
+  `BOT_MODE=login`'s identical `SIGTERM` pattern responding correctly to `docker stop`)
+  and that a SIGTERM arriving *before* either monitored loop (e.g. during the brief
+  pre-join click sequence) doesn't hang — it just lets the bot's normal fast-fail path
+  finish and exit on its own, confirmed by timing two runs (with and without an early
+  `docker stop`) that landed within a couple seconds of each other (~24-27s, which
+  turned out to be guest mode's genuine cold-start time for a brand-new profile
+  directory, not a hang).
+- **NOT verified**: real Google Meet DOM interaction. I have no real Gmail credentials
+  or a second human to actually join a call with in this environment, and logging in
+  requires a password/2FA I can't provide. `selectors.yaml` is built from publicly
+  known Meet UI patterns but is **unverified against the live Meet UI** — treat the
+  first real test run as a selector-debugging session, not a sure thing. This is
+  exactly why `selectors.yaml` is the one file concentrating all of them.
+
+### Setup
+
+```bash
+mkdir -p bot-profiles/notetaker1 bot-profiles/notetaker2 recordings  # already created
+docker compose build bot
+```
+
+`HOST_PROJECT_DIR` in `.env` must be this repo's absolute path **on the host** (already
+set). Without it, the scheduler's bot-launcher logs an error and skips launching —
+manual `docker compose run bot` testing doesn't need it at all.
+
+### Step-by-step: run a guest-mode test against a real Meet link (default, start here)
+
+No profile setup needed — `BOT_JOIN_MODE=guest` is the default, so this is the fastest
+path to a first real test.
+
+1. Create (or open) a real Google Meet call — e.g. https://meet.google.com/new — and
+   leave it open so you can admit the bot from the host side.
+2. Create the meeting record (manual trigger, per your instruction — not via calendar
+   sync):
+   ```bash
+   curl -X POST localhost:8000/meetings -H 'content-type: application/json' \
+     -d '{"meet_url":"https://meet.google.com/<your-real-code>","scheduled_at":"2026-10-11T12:00:00Z"}'
+   ```
+   Copy the `id` from the response.
+3. Run the bot directly against it (foreground, so you can watch it join live):
+   ```bash
+   docker compose run --rm -e MEETING_ID=<id-from-step-2> bot
+   ```
+4. In the real Meet call, watch for **"Fincelerate Notetaker (recording)"** asking to
+   join — this is the normal path (your Workspace's Meet "Domain" setting allows
+   non-signed-in users), admit it like any guest.
+5. Check the Meet chat for the bot's consent message.
+6. Talk for a bit, then either hang up, remove the bot, leave it alone for 60s+ to
+   trigger the alone-timeout leave, or `docker stop <container-name>` (grab the name
+   from `docker ps` — compose auto-generates one) to test the graceful-shutdown path:
+   either way the bot should leave cleanly and upload whatever was recorded.
+7. Watch the terminal: you should see `bot_starting` (`join_mode=guest`) →
+   `admitted_to_call` → `consent_message_posted` → `leaving_meeting` → `bot_finished`.
+
+### Step-by-step: save each bot's Chrome profile (only needed for `BOT_JOIN_MODE=signed_in`)
+
+Skip this unless you're switching `BOT_JOIN_MODE` to `signed_in` — guest mode above
+needs no profile at all.
+
+1. Run login mode for the first account, publishing the VNC port:
+   ```bash
+   docker compose run --rm -d -p 5900:5900 \
+     -e BOT_MODE=login -e BOT_PROFILE_PATH=/bot-profiles/notetaker1 \
+     --name bot-login-notetaker1 bot
+   ```
+2. Connect any VNC client to `localhost:5900` (no password) — e.g. macOS Screen Sharing
+   (`Finder > Go > Connect to Server > vnc://localhost:5900`), RealVNC, TigerVNC.
+3. In the Chrome window, sign in to `fincelerate.notetaker1@gmail.com` (handle 2FA if
+   prompted).
+4. **Set the Google account's own display name to `Fincelerate Notetaker (recording)`**
+   (Google Account settings, not a Meet setting) — Meet shows this automatically on
+   join without the bot needing to edit anything in the join UI.
+5. Stop the container — this closes the browser cleanly so the session persists:
+   ```bash
+   docker stop bot-login-notetaker1
+   ```
+6. Repeat for the second account (use a different host port, e.g. `-p 5901:5900`, if
+   running both at once):
+   ```bash
+   docker compose run --rm -d -p 5900:5900 \
+     -e BOT_MODE=login -e BOT_PROFILE_PATH=/bot-profiles/notetaker2 \
+     --name bot-login-notetaker2 bot
+   # ... sign in via VNC, set display name, then:
+   docker stop bot-login-notetaker2
+   ```
+7. Run the same test as above, but with `BOT_JOIN_MODE=signed_in`:
+   ```bash
+   docker compose run --rm -e MEETING_ID=<id> -e BOT_JOIN_MODE=signed_in bot
+   ```
+   Expect `bot_starting` to log `join_mode=signed_in`, and the bot to show up in the
+   Meet call as the signed-in `fincelerate.notetaker*@gmail.com` account instead of an
+   anonymous guest.
+
+### Step-by-step: check the recorded audio and speakers.jsonl
+
+1. `curl localhost:8000/meetings/<id>` — confirm `"status": "recorded"` and that
+   `audio_key` / `speaker_events_key` are populated.
+2. Local copies land directly on the host (bind-mounted) even before upload:
+   ```bash
+   ls -la recordings/<id>/
+   # audio_00000.wav  (audio_00001.wav, ... if the call ran past audio_segment_seconds)
+   # speakers.jsonl
+   ```
+3. Play the audio (16kHz mono PCM WAV): `afplay recordings/<id>/audio_00000.wav` on
+   macOS, or open with VLC/any player.
+4. Inspect speaker events: `cat recordings/<id>/speakers.jsonl` — one JSON object per
+   line, e.g. `{"ts": "...", "event": "participant_count", "count": 2}`.
+5. The same two artifacts were also uploaded to object storage at
+   `meetings/<id>/audio/` and `meetings/<id>/speakers.jsonl` in the `meet-intelligence`
+   bucket — confirmed by `audio_key`/`speaker_events_key` being set on the meeting row
+   in step 1 (the bot only sets those after a successful upload).
+
+### Tests
+
+`tests/test_bot_helpers.py` (selectors.yaml loads correctly, pure JSON/datetime
+helpers, plus — new this round — `_wait_for_admission`/`_monitor_call` against a fake
+Playwright-`Page` stand-in: admission success/timeout/denied/crashed, and
+`_monitor_call`'s `removed_or_left`/`max_duration_reached`/crash/graceful-shutdown
+paths including that the shutdown path actually clicks "Leave call") and
+`tests/test_bot_launcher.py` (the atomic `scheduled → joining` claim never
+double-claims, `due_meetings` respects the lead window and grace cutoff, launching
+without `HOST_PROJECT_DIR` is a clean no-op) — 65 total, all passing. The fake-`Page`
+tests are what actually exercise the crash/shutdown control flow end-to-end at the
+logic level; nothing here spins up Playwright/a real browser — that's the "what's
+verified vs. not" section above.
+
+```bash
+pytest
+```
+
+### Open questions / risks for you
+
+1. **`selectors.yaml` needs live verification** against the real Meet UI — expect the
+   first real test run above to fail at some selector and need an update. This is
+   expected, not a sign something else is broken.
+2. **`docker.sock` mounted into `scheduler`** — full Docker API access from that
+   container. Flagging as a Phase 7 hardening item, not fixing now.
+3. **`audio_key` is a prefix, not a single key** — make sure Phase 3's diarization step
+   lists objects under it rather than assuming one file.
+4. **The admission flow currently has no distinct "waiting, still pending" status** —
+   a meeting sits at `joining` for the whole Ask-to-join wait, then flips to `in_call`
+   or `bot_rejected`. If you want visibility into "currently in the waiting room" vs.
+   "bot container hasn't started yet", that'd need a new status; didn't add one since
+   you didn't ask for it and `joining` covers both reasonably.
+5. **Chromium, not Chrome** — flagging again since it's a real behavioral difference
+   from the originally-imagined "Chrome" bot, even though I think it's the right call
+   for this stack (see "What's built" above).
+6. ~~`run_bot_mode` doesn't register a `SIGTERM` handler~~ — **fixed this round**, see
+   "SIGTERM/SIGINT now leave gracefully" above.
+7. **Guest mode's cold-start is noticeably slower than signed_in's warm profile** — a
+   brand-new temp profile directory takes longer to initialize than an
+   already-used persistent one (~24-27s vs. the ~10-15s seen in the previous round,
+   timed live). Not a bug, just a real cost of "fresh profile every time" — worth
+   knowing if call-join latency ever matters (e.g. for `ADMISSION_TIMEOUT_SECONDS`
+   budgeting), though it's still well inside the current 120s default.
+8. **`BOT_JOIN_MODE` isn't validated** — anything other than exactly `"guest"` falls
+   through to the `signed_in` branch (`account.profile_path`) rather than raising on a
+   typo'd value. Low risk (two possible values, both meaningful), flagging rather than
+   adding validation you didn't ask for.

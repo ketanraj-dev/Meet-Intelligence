@@ -41,6 +41,43 @@ class Settings(BaseSettings):
     bot_reservation_lead_seconds: int = 120
     bot_reservation_tail_seconds: int = 1800
 
+    # Meeting bot (Phase 2)
+    bot_display_name: str = "Fincelerate Notetaker (recording)"
+    bot_consent_message: str = (
+        "Fincelerate Notetaker is recording and transcribing this meeting for internal analysis."
+    )
+    admission_timeout_seconds: int = 120
+    alone_timeout_seconds: int = 60
+    max_meeting_duration_seconds: int = 7200
+    speaker_poll_interval_ms: int = 250
+    audio_segment_seconds: int = 300
+    recordings_dir: str = "/recordings"
+    # How long to wait for the page to settle (networkidle, best-effort) and
+    # a recognizable pre-join screen to appear, before even trying the name
+    # field. Longer than the old implicit ~5s so slow-loading pages (or ones
+    # on an unexpected screen) get logged clearly instead of silently racing.
+    pre_join_wait_seconds: int = 30
+    # "guest" = fresh temp profile, no sign-in, types the name field.
+    # "signed_in" = the checked-out pool account's saved persistent profile.
+    bot_join_mode: str = "guest"
+    bot_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    # Grace period before Docker SIGKILLs a bot container — must be long
+    # enough for the SIGTERM handler to leave the call, stop ffmpeg, and
+    # upload the recording.
+    bot_stop_timeout_seconds: int = 30
+
+    # Scheduler bot-launcher (docker-outside-of-docker)
+    bot_launch_lead_seconds: int = 60
+    bot_image: str = "meet-intelligence-bot"
+    docker_network: str = "meet-intelligence_default"
+    host_project_dir: str | None = None
+
+    # Processing queue (Phase 3 adds the consumer)
+    processing_queue_name: str = "meet-intelligence:processing"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

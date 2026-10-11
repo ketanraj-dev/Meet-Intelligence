@@ -31,6 +31,14 @@ def _is_gone(exc: HttpError) -> bool:
     return status == 410
 
 
+def _auto_add_bot_guest_enabled(settings: Settings) -> bool:
+    """AUTO_ADD_BOT_GUEST only makes sense when the bot actually signs in as
+    the pool account (BOT_JOIN_MODE=signed_in) — a guest-mode bot never uses
+    that Gmail identity to join, so inviting it as a calendar guest would be
+    misleading. Takes precedence over the raw env flag."""
+    return settings.auto_add_bot_guest and settings.bot_join_mode == "signed_in"
+
+
 def _get_or_create_sync_state(db: Session, employee_email: str, calendar_id: str) -> CalendarSyncState:
     stmt = select(CalendarSyncState).where(
         CalendarSyncState.calendar_owner_email == employee_email,
@@ -197,7 +205,7 @@ def _apply_event(
             released_account = cancel_reservation(db, existing.id)
             db.flush()
 
-            if released_account is not None and settings.auto_add_bot_guest and existing.google_event_id:
+            if released_account is not None and _auto_add_bot_guest_enabled(settings) and existing.google_event_id:
                 from calendar_sync.guests import remove_bot_guest
 
                 try:
@@ -257,7 +265,7 @@ def _apply_event(
 
         if time_changed:
             bot_jobs.reschedule_job(existing)
-            if settings.auto_add_bot_guest:
+            if _auto_add_bot_guest_enabled(settings):
                 from calendar_sync.guests import sync_bot_guest
 
                 sync_bot_guest(db, existing, calendar_id=calendar_id)
@@ -288,7 +296,7 @@ def _apply_event(
     _ensure_client_participant(db, meeting, event, employee_email, bot_emails)
 
     bot_jobs.schedule_job(meeting)
-    if settings.auto_add_bot_guest:
+    if _auto_add_bot_guest_enabled(settings):
         from calendar_sync.guests import sync_bot_guest
 
         sync_bot_guest(db, meeting, calendar_id=calendar_id)

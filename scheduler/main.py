@@ -1,8 +1,8 @@
 """Entry point for the `scheduler` container.
 
-Runs the calendar poller and the bot-account reaper as independent background
-loops. Phase 2 adds a third loop here that launches bot containers at
-scheduled_at - 60s (and the launcher will call bot_pool.service.checkout_or_mark_unavailable).
+Runs three independent background loops: the calendar poller, the bot-pool
+reaper, and the bot-launcher (launches one bot container per meeting at
+scheduled_at - BOT_LAUNCH_LEAD_SECONDS).
 """
 import threading
 import time
@@ -12,6 +12,7 @@ from calendar_sync.poller import run_forever as run_calendar_poller
 from common.config import get_settings
 from common.db import SessionLocal
 from common.logging import configure_logging, get_logger
+from scheduler.bot_launcher import run_forever as run_bot_launcher
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,7 @@ def main() -> None:
 
     threading.Thread(target=run_calendar_poller, daemon=True, name="calendar-poller").start()
     threading.Thread(target=_run_reaper_forever, daemon=True, name="bot-pool-reaper").start()
+    threading.Thread(target=run_bot_launcher, daemon=True, name="bot-launcher").start()
 
     logger.info("scheduler_started")
     while True:

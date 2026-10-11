@@ -1,9 +1,13 @@
 """Admin CLI for the bot account pool.
 
-    python -m bot_pool.cli add --email bot1@gmail.com --profile-path /profiles/bot1
+    python -m bot_pool.cli add --email bot1@gmail.com --profile-path /bot-profiles/bot1
     python -m bot_pool.cli list
     python -m bot_pool.cli disable --email bot1@gmail.com
     python -m bot_pool.cli enable --email bot1@gmail.com
+
+--profile-path is the path AS SEEN INSIDE THE BOT CONTAINER (e.g.
+/bot-profiles/bot1, matching the ./bot-profiles bind mount in
+docker-compose.yml's `bot` service), not a path on the host.
 
 See README "Bot account setup" for how to log an account in and capture its
 Chrome profile before adding it here.

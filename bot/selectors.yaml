@@ -1,0 +1,34 @@
+# All Google Meet DOM selectors live here — bot.py never hardcodes a selector.
+#
+# IMPORTANT: these are best-effort, based on publicly documented Meet UI
+# patterns as of this writing. They have NOT been verified against a live
+# Meet call (this environment has no real Chrome/Meet/Gmail access). Expect
+# to need to update these after the first real test run — use the browser's
+# devtools inspector on an actual Meet call and prefer aria-labels and
+# visible text over CSS classes (Google's class names are obfuscated/rotate
+# frequently; aria-labels and button text are far more stable).
+
+pre_join:
+  # Only present when joining without being logged in as a recognized org
+  # member — may not appear at all for an external Gmail account; bot.py
+  # treats a missing/failing selector here as non-fatal.
+  name_input: 'input[aria-label="Your name"]'
+  mic_toggle: 'div[aria-label*="Turn off microphone"]'
+  camera_toggle: 'div[aria-label*="Turn off camera"]'
+  ask_to_join_button: 'button:has-text("Ask to join")'
+  join_now_button: 'button:has-text("Join now")'
+  dismiss_got_it: 'button:has-text("Got it")'
+
+admission:
+  waiting_text: 'text=Asking to be let in'
+  denied_text: 'text=No one responded to your request to join the call'
+  removed_text: 'text=You were removed from the meeting'
+
+in_call:
+  leave_call_button: 'button[aria-label="Leave call"]'
+  people_panel_toggle: 'button[aria-label="People"]'
+  chat_panel_toggle: 'button[aria-label="Chat with everyone"]'
+  chat_message_input: 'textarea[aria-label="Send a message"]'
+  chat_send_button: 'button[aria-label="Send a message"]'
+  # Each participant tile/row while the People panel is open.
+  participants_list_item: '[role="listitem"]'

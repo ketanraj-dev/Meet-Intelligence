@@ -15,3 +15,7 @@ google-api-python-client>=2.140
 google-auth>=2.34
 google-auth-httplib2>=0.2
 google-auth-oauthlib>=1.2
+
+# Bot account pool / processing queue producer / scheduler's bot-launcher
+redis>=5.0
+docker>=7.0
