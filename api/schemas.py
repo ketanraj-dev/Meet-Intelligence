@@ -30,6 +30,7 @@ class MeetingRead(BaseModel):
     expected_languages: list[str] | None
     audio_key: str | None
     speaker_events_key: str | None
+    speaking_indicator_suspect: bool
     error: str | None
     google_event_id: str | None
     google_ical_uid: str | None

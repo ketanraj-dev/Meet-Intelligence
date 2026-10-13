@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     alone_timeout_seconds: int = 60
     max_meeting_duration_seconds: int = 7200
     speaker_poll_interval_ms: int = 250
+    # Raw per-tile speaking-indicator reads flicker a lot (confirmed on a
+    # real call: dozens of sub-second start/stop pairs from normal speech
+    # pauses). Debounced before being written to speakers.jsonl: a
+    # stop->start gap shorter than this is merged into one continuous
+    # speaking period (no stop/start emitted for the gap).
+    speaking_debounce_gap_seconds: float = 1.0
+    # A speaking burst shorter than this is dropped entirely (treated as
+    # noise, not a real speaking_start/stop pair).
+    speaking_min_burst_seconds: float = 0.3
     audio_segment_seconds: int = 300
     recordings_dir: str = "/recordings"
     # How long to wait for the page to settle (networkidle, best-effort) and
@@ -57,9 +66,11 @@ class Settings(BaseSettings):
     # field. Longer than the old implicit ~5s so slow-loading pages (or ones
     # on an unexpected screen) get logged clearly instead of silently racing.
     pre_join_wait_seconds: int = 30
-    # "guest" = fresh temp profile, no sign-in, types the name field.
-    # "signed_in" = the checked-out pool account's saved persistent profile.
-    bot_join_mode: str = "guest"
+    # "signed_in" = the checked-out pool account's saved persistent profile
+    # (default — guest mode is blocked outright by Google: "You can't join
+    # this video call", confirmed on a real test). "guest" = fresh temp
+    # profile, no sign-in, types the name field; kept as an option.
+    bot_join_mode: str = "signed_in"
     bot_user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -68,6 +79,13 @@ class Settings(BaseSettings):
     # enough for the SIGTERM handler to leave the call, stop ffmpeg, and
     # upload the recording.
     bot_stop_timeout_seconds: int = 30
+    # Periodic (~60s) in-call debug captures (screenshot + HTML + console)
+    # were essential for fixing selectors against real Meet DOM during
+    # development, but are unneeded overhead once those selectors are
+    # stable. Off by default; set true to re-enable while diagnosing a new
+    # issue. Failure-triggered and key-moment captures (join click,
+    # admission, exceptions) are unconditional regardless of this flag.
+    bot_debug_capture: bool = False
 
     # Scheduler bot-launcher (docker-outside-of-docker)
     bot_launch_lead_seconds: int = 60

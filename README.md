@@ -443,6 +443,15 @@ service account reading/editing **employee** calendars; bot identity is unrelate
 
 ## Phase 2 — The meeting bot
 
+**Status: COMPLETE.** Verified end-to-end on a real two-person Google Meet call
+(meeting `e140849a-6c26-4130-828d-b47a9990e7a1`): correct admission timing (no false
+early "in_call"), the consent message posted to chat, both participants' real names
+captured via join/leave events, speaking events logged for both participants, good
+audio quality throughout, and a clean auto-leave at the end. See "Phase 2 close-out"
+at the end of this section for the full verified-results writeup and the final round
+of fixes that got it there. The rest of this section is the round-by-round build log
+leading up to that, left as-is rather than rewritten.
+
 **What's built:**
 - `bot/` — the meeting bot container: `Dockerfile`, `entrypoint.sh`, `bot.py`,
   `selectors.yaml`, `requirements.txt`.
@@ -642,12 +651,14 @@ field through as `FIELD_NAME: str(value)` — verified it produces 43 env vars i
   `docker stop`) that landed within a couple seconds of each other (~24-27s, which
   turned out to be guest mode's genuine cold-start time for a brand-new profile
   directory, not a hang).
-- **NOT verified**: real Google Meet DOM interaction. I have no real Gmail credentials
-  or a second human to actually join a call with in this environment, and logging in
-  requires a password/2FA I can't provide. `selectors.yaml` is built from publicly
-  known Meet UI patterns but is **unverified against the live Meet UI** — treat the
-  first real test run as a selector-debugging session, not a sure thing. This is
-  exactly why `selectors.yaml` is the one file concentrating all of them.
+- ~~**NOT verified**: real Google Meet DOM interaction~~ — **since resolved.** This was
+  true at the time (no Gmail credentials or a second human available in this
+  environment to actually join a call with). You ran the real tests from here —
+  several rounds of them, each selector fixed against the real captured DOM from the
+  previous round's failure, not guessed. Every selector in `selectors.yaml` is now
+  either confirmed-correct against real captures or explicitly flagged where it isn't
+  (`speaking_indicator`, still CSS-verified but not yet instance-confirmed — see its
+  comment there). See "Phase 2 close-out" at the end of this section.
 
 ### Setup
 
@@ -736,12 +747,19 @@ needs no profile at all.
    ```bash
    ls -la recordings/<id>/
    # audio_00000.wav  (audio_00001.wav, ... if the call ran past audio_segment_seconds)
-   # speakers.jsonl
+   # speakers.jsonl       -- debounced participant join/leave + speaking events
+   # speakers_raw.jsonl   -- same, but pre-debounce (every raw indicator flicker)
    ```
 3. Play the audio (16kHz mono PCM WAV): `afplay recordings/<id>/audio_00000.wav` on
    macOS, or open with VLC/any player.
 4. Inspect speaker events: `cat recordings/<id>/speakers.jsonl` — one JSON object per
-   line, e.g. `{"ts": "...", "event": "participant_count", "count": 2}`.
+   line. `t` is seconds since the recording started (same clock as the WAV),`ts` is
+   wall-clock. Participant events:
+   `{"t": 27.94, "ts": "...", "event": "participant_joined", "participant_id": "spaces/.../devices/437", "name": "Ketan Raj"}`
+   (`participant_left` the same shape). Speaking events, debounced per
+   `SPEAKING_MIN_BURST_SECONDS`/`SPEAKING_DEBOUNCE_GAP_SECONDS`:
+   `{"t": 42.93, "ts": "...", "event": "speaking_start", "participant_id": "spaces/.../devices/437", "name": "Ketan Raj"}`
+   (`speaking_stop` the same shape). The bot's own tile is never included.
 5. The same two artifacts were also uploaded to object storage at
    `meetings/<id>/audio/` and `meetings/<id>/speakers.jsonl` in the `meet-intelligence`
    bucket — confirmed by `audio_key`/`speaker_events_key` being set on the meeting row
@@ -794,3 +812,67 @@ pytest
    through to the `signed_in` branch (`account.profile_path`) rather than raising on a
    typo'd value. Low risk (two possible values, both meaningful), flagging rather than
    adding validation you didn't ask for.
+
+### Phase 2 close-out — final verified real test + last round of fixes
+
+Everything above this subsection is the round-by-round build log (left as written, not
+retroactively edited) from first boot through several rounds of real-test-driven
+selector/logic fixes. This is the final status.
+
+**Final verified real test** (meeting `e140849a-6c26-4130-828d-b47a9990e7a1`, two real
+participants, `BOT_JOIN_MODE=signed_in`):
+- Admission timing correct — no false early `in_call` (the `participant_count >= 2`
+  fix from an earlier round held up: the bot's own tile no longer gets mistaken for
+  another participant in the waiting room).
+- Consent message posted to the in-call chat successfully.
+- Both participants' real display names captured, via `participant_joined` events
+  keyed off each tile's `[aria-label^="Pin "]` descendant.
+- `speaking_start`/`speaking_stop` events logged for **both** participants, confirming
+  the `.DYfzY` speaker-circle CSS class selector (found in the real page's own
+  compiled stylesheet — see `selectors.yaml`) actually works live, not just in theory.
+- Audio quality good throughout (`audio_level_check` showed real speech, not silence).
+- Clean auto-leave at the end.
+
+**Final round of fixes, made directly from that test's real `speakers.jsonl`/debug
+output:**
+- **Speaking-event debounce.** The raw `speaking_indicator` reading flickers heavily —
+  the real `speakers.jsonl` from the test above showed dozens of sub-second
+  start/stop pairs from ordinary speech pauses. `_SpeakingDebouncer` in `bot.py` now
+  merges a stop→start gap shorter than `SPEAKING_DEBOUNCE_GAP_SECONDS` (default 1.0s,
+  same participant) into one continuous speaking period, and drops a burst shorter
+  than `SPEAKING_MIN_BURST_SECONDS` (default 0.3s) entirely. Emitted events are
+  backdated to the real raw transition time, not the (delayed) moment the debounce
+  window confirmed them. The pre-debounce raw flicker is still logged, to a sibling
+  `speakers_raw.jsonl`, in case the thresholds ever need re-tuning against real data.
+- **`waiting_room` phase now actually gets logged.** It never did — `admission_phase_
+  changed` went straight from `pending` to `in_call`, across every real test run so
+  far, because `selectors.yaml`'s `waiting_text` (`"Asking to be let in"`) never once
+  matched the real DOM (grepped three separate real captures for it and every
+  plausible variant — zero matches each time). Since Ask-to-join → waiting room →
+  admitted is the only real path for these external-Gmail bot accounts, "not yet
+  admitted" is now treated as `waiting_room` directly, instead of depending on that
+  unverified text to promote it out of `pending` — so a stuck wait is now visible in
+  the logs regardless of whether that text selector ever matches.
+- **End-of-call self-check for a silently-broken `speaking_indicator`.** If
+  `audio_level_check` found real speech but the call produced zero confirmed
+  `speaking_start` events, that's a strong signal the `.DYfzY` selector stopped
+  matching (e.g. a future Meet UI change) — which would otherwise fail silently,
+  producing empty-but-plausible-looking speaker data. `_monitor_call` now logs
+  `speaking_indicator_selector_likely_broken` and returns a flag that `run_bot_mode`
+  writes to the new `meetings.speaking_indicator_suspect` column (migration `0004`) —
+  queryable per meeting instead of only discoverable by reading logs after the fact.
+- **Bot build version logged on startup.** A prior round's test accidentally ran
+  against a stale image (forgot to rebuild after a code change) and that was only
+  discovered after the fact. There's no `.git` directory in this checkout to pull a
+  commit hash from, so `bot/Dockerfile` bakes a UTC build timestamp into the image
+  instead (`bot/BUILD_VERSION`, written by a `RUN date ...` layer that only reruns —
+  producing a fresh timestamp — when the source actually changed). `main()` logs it as
+  `bot_code_version` before doing anything else, so the running build is visible
+  immediately instead of only inferable from behavior.
+
+**Known gap going into Phase 3**: `speaking_indicator` is CSS-verified (pulled from
+the real page's own compiled stylesheet, not guessed) but still hasn't been seen
+actively matching mid-utterance in a captured screenshot — every debug capture so far
+happened to land on a silent instant. The live test above confirms it works in
+practice (both participants produced real speaking events), so this is now a
+theoretical/documentation gap, not a functional one.

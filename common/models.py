@@ -63,6 +63,18 @@ class Meeting(Base):
     expected_languages: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     audio_key: Mapped[str | None] = mapped_column(String, nullable=True)
     speaker_events_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Set by the bot's end-of-call self-check when the recorded audio showed
+    # real speech but zero speaking_start events were ever logged — a strong
+    # sign selectors.yaml's speaking_indicator stopped matching (e.g. a Meet
+    # UI change), silently producing empty-but-valid-looking speaker data.
+    speaking_indicator_suspect: Mapped[bool] = mapped_column(nullable=False, default=False)
+    # Counts failed bot_launcher launch attempts (container never actually
+    # started — e.g. a bad docker-py call, Docker daemon unreachable). A
+    # failed launch reverts status to `scheduled` so the next poll retries,
+    # up to bot_launcher.MAX_LAUNCH_ATTEMPTS, then gives up and sets
+    # `failed`. Never incremented by the bot container itself — only by the
+    # scheduler's launch path, before a container exists at all.
+    launch_attempts: Mapped[int] = mapped_column(nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     google_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
     google_ical_uid: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)

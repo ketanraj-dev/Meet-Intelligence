@@ -1,22 +1,32 @@
 # All Google Meet DOM selectors live here — bot.py never hardcodes a selector.
 #
-# IMPORTANT: these are best-effort, based on publicly documented Meet UI
-# patterns as of this writing. They have NOT been verified against a live
-# Meet call (this environment has no real Chrome/Meet/Gmail access). Expect
-# to need to update these after the first real test run — use the browser's
-# devtools inspector on an actual Meet call and prefer aria-labels and
-# visible text over CSS classes (Google's class names are obfuscated/rotate
-# frequently; aria-labels and button text are far more stable).
+# `leave_call_button`, `mic_toggle`, `camera_toggle`, `chat_panel_toggle`,
+# `chat_message_input`, `chat_send_button`, `participants_list_item`, and
+# `participant_name_label` below are all confirmed against real captured
+# in-call pages (recordings/<id>/debug/ from real test calls) — their
+# aria-labels / attributes matched exactly. `speaking_indicator` is pulled
+# from the real page's own compiled CSS but hasn't yet been seen actively
+# matching a live tile (every capture so far caught a silent instant) — see
+# its own comment below.
+#
+# The join button itself is NOT selector-based anymore — a real bug came
+# from detection and the click using different selectors for it (see
+# _detect_screen's docstring in bot.py). It's now a single role-based
+# locator shared by both (JOIN_BUTTON_NAME_RE in bot.py), so there's nothing
+# to configure here for it.
 
 pre_join:
   # Only present when joining without being logged in as a recognized org
   # member — may not appear at all for an external Gmail account; bot.py
   # treats a missing/failing selector here as non-fatal.
   name_input: 'input[aria-label="Your name"]'
+  # FALLBACK only — primary method is Meet's keyboard shortcuts (Ctrl+D /
+  # Ctrl+E) verified via a role-based locator's aria-label. These CSS
+  # selectors only get used if that whole role-based path fails outright.
+  # Confirmed real aria-label values (from the in-call screen, same text
+  # pattern Meet uses pre-join): "Turn off microphone" / "Turn off camera".
   mic_toggle: 'div[aria-label*="Turn off microphone"]'
   camera_toggle: 'div[aria-label*="Turn off camera"]'
-  ask_to_join_button: 'button:has-text("Ask to join")'
-  join_now_button: 'button:has-text("Join now")'
   dismiss_got_it: 'button:has-text("Got it")'
 
 admission:
@@ -25,10 +35,64 @@ admission:
   removed_text: 'text=You were removed from the meeting'
 
 in_call:
-  leave_call_button: 'button[aria-label="Leave call"]'
+  leave_call_button: 'button[aria-label="Leave call"]'  # confirmed real
+  # Unused by bot.py currently; real captured aria-labels showed "Meeting
+  # details" / "Left side panel" / "Side panel" instead — likely stale.
   people_panel_toggle: 'button[aria-label="People"]'
-  chat_panel_toggle: 'button[aria-label="Chat with everyone"]'
+  chat_panel_toggle: 'button[aria-label="Chat with everyone"]'  # confirmed real
+  # Both confirmed real against a 3-person capture's in-call HTML (exactly 2
+  # occurrences of aria-label="Send a message" in the DOM, no ambiguity):
+  # <textarea jsname="YPqjbf" ... aria-label="Send a message"
+  # placeholder="Send a message" ...> and a sibling <button
+  # aria-label="Send a message" disabled>. The send-fails-silently bug was
+  # NOT a bad selector — it was the panel-open animation not finishing
+  # within the old 5s wait_for_selector timeout, combined with the panel
+  # never being closed on that failure path (see _post_consent_message).
   chat_message_input: 'textarea[aria-label="Send a message"]'
   chat_send_button: 'button[aria-label="Send a message"]'
-  # Each participant tile/row while the People panel is open.
-  participants_list_item: '[role="listitem"]'
+  # Each participant's video tile. CONFIRMED real — grep'd the real captured
+  # in-call HTML: `data-participant-id="spaces/.../devices/..."` appeared
+  # exactly twice (matching the 2 real participants in that call), while the
+  # old `[role="listitem"]` appeared ZERO times — that's why participant_count
+  # was always 0 all call. This selector counts tiles directly in the main
+  # grid; it does NOT require the People panel to be open (unlike the old
+  # comment on this key implied).
+  #
+  # IMPORTANT: this also matches the bot's OWN tile, which renders (with a
+  # real data-participant-id) even while the bot is still in the waiting
+  # room, before a host admits it — confirmed live: participant_count sat
+  # at 1 (bot's own tile only) through the whole waiting period, then
+  # jumped to 3 the instant the host actually let it in. See
+  # _is_admitted's docstring in bot.py for how this is now handled.
+  participants_list_item: '[data-participant-id]'
+  # Within a tile, this descendant is present ONLY on *other* participants'
+  # tiles, never the bot's own — confirmed against the real 3-person
+  # capture: "Pin Information Technology to your main screen" and "Pin
+  # Ketan Raj to your main screen" both matched exactly once each, but
+  # there was no "Pin Finbot2 ..." anywhere (the bot's own tile — the 3rd
+  # one, "Finbot2" — had "Backgrounds and effects" there instead). Used
+  # both to extract each other participant's display name AND, by its
+  # absence, to identify/exclude the bot's own tile without needing to
+  # know the bot's own name or participant id ahead of time.
+  participant_name_label: '[aria-label^="Pin "]'
+  # Found in the real captured page's own compiled CSS (meeting
+  # db03c41f-45e1-4870-8de7-449d3523d9b5, in_call_60s/page.html), not
+  # guessed: every tile contains a `<div class="DYfzY cYKTje gjg47c">` —
+  # the avatar's audio-reactive "speaker circle" ring. The stylesheet
+  # defines :after on .DYfzY as a circle whose transform:scale grows
+  # through 5 discrete steps as 5 modifier classes are added one at a
+  # time — OgVli (.575) -> HX2H7 (.65) -> wEsLMd (.725) -> Oaajhc (.8) ->
+  # I8fSpb (.875) — i.e. Meet pulses this ring in sync with that
+  # participant's live mic amplitude. Base `DYfzY` with none of those 5
+  # present = not currently speaking. All 3 captures gathered so far
+  # happened to land on a silent instant (every tile had bare "DYfzY
+  # cYKTje gjg47c", no modifier), so this is CSS-verified but not yet
+  # confirmed against a live "modifier class present" instance — if it
+  # doesn't fire on the next real test, re-capture while someone is mid
+  # word and check which class (if any) actually shows up here.
+  #
+  # CAVEAT: unlike the aria-label selectors elsewhere in this file, these
+  # are Google's own compiled/minified class names (not semantic
+  # attributes) — more likely to shift on a future Meet deploy than
+  # anything else here.
+  speaking_indicator: '.DYfzY.OgVli, .DYfzY.HX2H7, .DYfzY.wEsLMd, .DYfzY.Oaajhc, .DYfzY.I8fSpb'

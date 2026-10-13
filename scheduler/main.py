@@ -17,12 +17,25 @@ from scheduler.bot_launcher import run_forever as run_bot_launcher
 logger = get_logger(__name__)
 
 
+def _reap_once(db, settings) -> list:
+    """Separated from the loop so it's testable: a previous version of this
+    loop called reap_stale() but never db.commit()'d it — reap_stale() only
+    flush()es by (documented) design, so every "successful" reap for the
+    whole lifetime of this bug was silently rolled back by db.close(), and
+    stuck accounts never actually got freed. Confirmed live: an account sat
+    `status=in_use` with a last_heartbeat_at hours stale despite the reaper
+    logging a successful reap for it every 30s."""
+    released = reap_stale(db, settings.bot_heartbeat_timeout_seconds)
+    db.commit()
+    return released
+
+
 def _run_reaper_forever() -> None:
     settings = get_settings()
     while True:
         db = SessionLocal()
         try:
-            released = reap_stale(db, settings.bot_heartbeat_timeout_seconds)
+            released = _reap_once(db, settings)
             if released:
                 logger.info("bot_pool_reaped", count=len(released))
         except Exception:

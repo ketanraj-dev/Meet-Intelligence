@@ -19,6 +19,13 @@ COPY bot_pool/ ./bot_pool/
 COPY bot/ ./bot/
 RUN chmod +x bot/entrypoint.sh
 
+# No .git directory in this checkout to pull a commit hash from, so a UTC
+# build timestamp is baked in instead — bot.py logs it on startup
+# (bot_code_version) so it's obvious which build is actually running. This
+# RUN only reruns (producing a fresh timestamp) when a layer above it
+# actually changed, i.e. real source changes — not on every build.
+RUN date -u +%Y%m%dT%H%M%SZ > bot/BUILD_VERSION
+
 ENV DISPLAY=:99
 ENV PYTHONUNBUFFERED=1
 
