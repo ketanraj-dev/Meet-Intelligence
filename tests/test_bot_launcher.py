@@ -8,7 +8,14 @@ from docker.types import HostConfig
 
 from common.config import get_settings
 from common.models import Meeting, MeetingStatus
-from scheduler.bot_launcher import MAX_LAUNCH_ATTEMPTS, _handle_launch_failure, claim_meeting, due_meetings, launch_container
+from scheduler.bot_launcher import (
+    MAX_LAUNCH_ATTEMPTS,
+    _handle_launch_failure,
+    claim_meeting,
+    due_meetings,
+    launch_container,
+    launch_health_check_container,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +142,27 @@ def test_launch_container_kwargs_are_valid_against_real_docker_py_signatures(mon
 
     assert fake_client.api.create_container_kwargs["stop_timeout"] == settings.bot_stop_timeout_seconds
     assert fake_client.api.create_host_config_kwargs["shm_size"] == "2g"
+    assert fake_client.api.started_container_id == "fake-container-id"
+
+
+def test_launch_health_check_container_kwargs_are_also_valid(monkeypatch):
+    """launch_health_check_container shares _run_bot_container with
+    launch_container — same real-signature validation, different
+    environment (BOT_MODE=health_check, BOT_ACCOUNT_ID instead of
+    MEETING_ID)."""
+    monkeypatch.setenv("HOST_PROJECT_DIR", "/srv/meet-intelligence")
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    fake_client = _FakeDockerClient()
+    monkeypatch.setattr(docker, "from_env", lambda: fake_client)
+
+    launch_health_check_container(settings, "11111111-1111-1111-1111-111111111111")
+
+    env = fake_client.api.create_container_kwargs["environment"]
+    assert env["BOT_MODE"] == "health_check"
+    assert env["BOT_ACCOUNT_ID"] == "11111111-1111-1111-1111-111111111111"
+    assert "MEETING_ID" not in env
     assert fake_client.api.started_container_id == "fake-container-id"
 
 

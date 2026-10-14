@@ -35,6 +35,18 @@ class StorageClient:
     def download_file(self, key: str, local_path: str | Path) -> None:
         self._client.download_file(self.bucket, key, str(local_path))
 
+    def list_objects(self, prefix: str) -> list[str]:
+        """All keys under prefix, in whatever order S3 returns them (not
+        necessarily sorted) — callers that need ordering (e.g. worker/
+        diarization.py concatenating audio_00000.wav, audio_00001.wav, ...
+        in order) must sort the result themselves."""
+        keys: list[str] = []
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+        return keys
+
     def presigned_url(self, key: str, expires_in: int = 3600) -> str:
         return self._client.generate_presigned_url(
             "get_object",

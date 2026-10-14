@@ -31,6 +31,7 @@ class MeetingRead(BaseModel):
     audio_key: str | None
     speaker_events_key: str | None
     speaking_indicator_suspect: bool
+    diarization_name_mapping_suspect: bool
     error: str | None
     google_event_id: str | None
     google_ical_uid: str | None
@@ -53,6 +54,9 @@ class BotAccountRead(BaseModel):
     status: BotAccountStatus
     current_meeting_id: UUID | None
     last_heartbeat_at: datetime | None
+    last_used_at: datetime | None
+    last_health_check_at: datetime | None
+    needs_relogin: bool
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

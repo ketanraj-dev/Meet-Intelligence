@@ -1,4 +1,6 @@
+import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +15,12 @@ from bot.bot import (
     GracefulShutdown,
     MIC_TOGGLE_NAME_RE,
     PageCrashed,
+    _account_is_signed_in,
     _SpeakingDebouncer,
     _bot_build_version,
     _check_audio_level,
+    _clear_stale_profile_lock,
+    _clear_stale_profile_lock_for_account,
     _click_join_button,
     _collect_participants,
     _detect_screen,
@@ -26,12 +31,15 @@ from bot.bot import (
     _monitor_call,
     _now_naive_utc,
     _post_consent_message,
+    _remove_singleton_lock_files,
     _save_debug_artifacts,
     _toggle_media_off,
     _wait_for_admission,
     _wait_for_pre_join_ready,
     load_selectors,
+    run_health_check_mode,
 )
+from common.models import BotAccount, BotAccountStatus
 
 
 def _debug_ctx_stub(tmp_path: Path) -> DebugContext:
@@ -262,6 +270,8 @@ def _settings_stub(**overrides):
         bot_debug_capture=False,
         speaking_debounce_gap_seconds=1.0,
         speaking_min_burst_seconds=0.3,
+        bot_health_check_run_timeout_seconds=5,
+        recordings_dir="/tmp/meet-intelligence-test-recordings",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -961,3 +971,346 @@ def test_debug_context_capture_delegates_to_save_debug_artifacts(tmp_path):
     ctx = DebugContext(_settings_stub_with_storage(), tmp_path, "11111111-1111-1111-1111-111111111111", ["[log] hi"])
     ctx.capture(page, "some_step")
     assert "Captured via DebugContext" in (tmp_path / "debug" / "some_step" / "page_info.json").read_text()
+
+
+# --- _account_is_signed_in / run_health_check_mode (item 6) -----------------------
+
+
+def test_account_is_signed_in_true_when_not_redirected_to_google_sign_in():
+    page = SimpleNamespace(url="https://myaccount.google.com/")
+    assert _account_is_signed_in(page) is True
+
+
+def test_account_is_signed_in_false_when_redirected_to_sign_in():
+    page = SimpleNamespace(url="https://accounts.google.com/signin/v2/identifier")
+    assert _account_is_signed_in(page) is False
+
+
+def test_account_is_signed_in_false_when_url_unreadable():
+    class Explodes:
+        @property
+        def url(self):
+            raise RuntimeError("page closed")
+
+    assert _account_is_signed_in(Explodes()) is False
+
+
+class _FakeHealthCheckPage:
+    def __init__(self, final_url: str):
+        self.url = final_url
+
+    def goto(self, url, wait_until=None, timeout=None):
+        pass
+
+    def wait_for_load_state(self, state, timeout=None):
+        pass
+
+
+class _FakeHealthCheckContext:
+    def __init__(self, final_url: str):
+        self._final_url = final_url
+        self.closed = False
+
+    def new_page(self):
+        return _FakeHealthCheckPage(self._final_url)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeHealthCheckChromium:
+    def __init__(self, final_url: str):
+        self._final_url = final_url
+
+    def launch_persistent_context(self, *args, **kwargs):
+        return _FakeHealthCheckContext(self._final_url)
+
+
+class _FakeSyncPlaywright:
+    def __init__(self, final_url: str):
+        self.chromium = _FakeHealthCheckChromium(final_url)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_run_health_check_mode_flags_needs_relogin_when_redirected(db_session, monkeypatch):
+    """End-to-end against a real (test) DB session — proves the result is
+    actually committed, not just computed. Playwright itself is faked
+    (final page.url after navigation is all this function reads)."""
+    from tests.conftest import TestingSessionLocal, fresh_from_db
+
+    account = BotAccount(email="a@example.com", profile_path="/p/a")
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    monkeypatch.setenv("BOT_ACCOUNT_ID", str(account_id))
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(
+        bot_module,
+        "sync_playwright",
+        lambda: _FakeSyncPlaywright("https://accounts.google.com/signin/v2/identifier"),
+    )
+
+    run_health_check_mode(_settings_stub())
+
+    refreshed = fresh_from_db(BotAccount, account_id)
+    assert refreshed.needs_relogin is True
+    assert refreshed.last_health_check_at is not None
+
+
+def test_run_health_check_mode_clears_needs_relogin_when_still_signed_in(db_session, monkeypatch):
+    from tests.conftest import TestingSessionLocal, fresh_from_db
+
+    account = BotAccount(email="a@example.com", profile_path="/p/a", needs_relogin=True)
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    monkeypatch.setenv("BOT_ACCOUNT_ID", str(account_id))
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(bot_module, "sync_playwright", lambda: _FakeSyncPlaywright("https://myaccount.google.com/"))
+
+    run_health_check_mode(_settings_stub())
+
+    refreshed = fresh_from_db(BotAccount, account_id)
+    assert refreshed.needs_relogin is False
+
+
+def test_run_health_check_mode_keeps_prior_value_when_the_check_itself_fails(db_session, monkeypatch):
+    """A transient failure (network blip, Playwright hiccup) is
+    inconclusive, not proof the session is broken — must not flip
+    needs_relogin based on nothing."""
+    from tests.conftest import TestingSessionLocal, fresh_from_db
+
+    account = BotAccount(email="a@example.com", profile_path="/p/a", needs_relogin=False)
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    def _raises():
+        raise RuntimeError("playwright boom")
+
+    monkeypatch.setenv("BOT_ACCOUNT_ID", str(account_id))
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(bot_module, "sync_playwright", _raises)
+
+    run_health_check_mode(_settings_stub())  # must not raise
+
+    refreshed = fresh_from_db(BotAccount, account_id)
+    assert refreshed.needs_relogin is False  # unchanged
+    assert refreshed.last_health_check_at is not None  # still recorded that a check was attempted
+
+
+def test_run_health_check_mode_accepts_email_instead_of_account_id(db_session, monkeypatch):
+    """A human running this by hand (per the README's manual command)
+    shouldn't have to look up a UUID first."""
+    from tests.conftest import TestingSessionLocal, fresh_from_db
+
+    account = BotAccount(email="notetaker1@example.com", profile_path="/p/a")
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    monkeypatch.delenv("BOT_ACCOUNT_ID", raising=False)
+    monkeypatch.setenv("BOT_ACCOUNT_EMAIL", "notetaker1@example.com")
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(bot_module, "sync_playwright", lambda: _FakeSyncPlaywright("https://myaccount.google.com/"))
+
+    run_health_check_mode(_settings_stub())
+
+    refreshed = fresh_from_db(BotAccount, account_id)
+    assert refreshed.last_health_check_at is not None
+    assert refreshed.needs_relogin is False
+
+
+def test_run_health_check_mode_errors_cleanly_with_neither_selector(monkeypatch):
+    from tests.conftest import TestingSessionLocal
+
+    monkeypatch.delenv("BOT_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("BOT_ACCOUNT_EMAIL", raising=False)
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    run_health_check_mode(_settings_stub())  # must not raise
+
+
+class _SlowFakeChromium:
+    def __init__(self, delay_seconds: float):
+        self._delay = delay_seconds
+
+    def launch_persistent_context(self, *args, **kwargs):
+        time.sleep(self._delay)
+        raise AssertionError("should never get here — the test asserts on the timeout, not this")
+
+
+class _SlowFakeSyncPlaywright:
+    def __init__(self, delay_seconds: float):
+        self.chromium = _SlowFakeChromium(delay_seconds)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_run_health_check_mode_times_out_rather_than_hanging(db_session, monkeypatch):
+    """Regression test for the actual incident: a stale profile lock made
+    a real health check hang for the full old (much longer) timeout with
+    nothing to show for it. The run must give up at
+    bot_health_check_run_timeout_seconds and still record *something*
+    (a timeout is logged, prior needs_relogin is kept, not left hanging
+    forever as an abandoned container)."""
+    from tests.conftest import TestingSessionLocal, fresh_from_db
+
+    account = BotAccount(email="a@example.com", profile_path="/p/a", needs_relogin=False)
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    monkeypatch.setenv("BOT_ACCOUNT_ID", str(account_id))
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(bot_module, "sync_playwright", lambda: _SlowFakeSyncPlaywright(2.0))
+
+    started = time.time()
+    run_health_check_mode(_settings_stub(bot_health_check_run_timeout_seconds=0.2))
+    elapsed = time.time() - started
+
+    assert elapsed < 1.5  # did NOT wait out the 2s "hang" — gave up at ~0.2s
+    refreshed = fresh_from_db(BotAccount, account_id)
+    assert refreshed.needs_relogin is False  # kept prior value, not guessed
+    assert refreshed.last_health_check_at is not None
+
+
+class _ExplodingFakePage:
+    url = "https://myaccount.google.com/"
+
+    def goto(self, url, wait_until=None, timeout=None):
+        raise RuntimeError("navigation boom")
+
+    def screenshot(self, path, full_page=True, timeout=None):
+        Path(path).write_bytes(b"fake-png")
+
+
+class _ExplodingFakeContext:
+    def __init__(self):
+        self.closed = False
+
+    def new_page(self):
+        return _ExplodingFakePage()
+
+    def close(self):
+        self.closed = True
+
+
+class _ExplodingFakeChromium:
+    def launch_persistent_context(self, *args, **kwargs):
+        return _ExplodingFakeContext()
+
+
+class _ExplodingFakeSyncPlaywright:
+    def __init__(self):
+        self.chromium = _ExplodingFakeChromium()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_run_health_check_mode_saves_debug_screenshot_when_inconclusive(db_session, monkeypatch, tmp_path):
+    from tests.conftest import TestingSessionLocal
+
+    account = BotAccount(email="a@example.com", profile_path="/p/a")
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    monkeypatch.setenv("BOT_ACCOUNT_ID", str(account_id))
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(bot_module, "sync_playwright", lambda: _ExplodingFakeSyncPlaywright())
+
+    run_health_check_mode(_settings_stub(recordings_dir=str(tmp_path)))
+
+    screenshots = list((tmp_path / "health_checks" / str(account_id)).glob("inconclusive_*.png"))
+    assert len(screenshots) == 1
+    assert screenshots[0].read_bytes() == b"fake-png"
+
+
+def test_run_health_check_mode_logs_each_step(db_session, monkeypatch):
+    from tests.conftest import TestingSessionLocal
+
+    account = BotAccount(email="a@example.com", profile_path="/p/a")
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+
+    steps: list[str] = []
+    real_info = bot_module.logger.info
+
+    def recording_info(event, **kwargs):
+        if event == "bot_account_health_check_step":
+            steps.append(kwargs.get("step"))
+        return real_info(event, **kwargs)
+
+    monkeypatch.setenv("BOT_ACCOUNT_ID", str(account_id))
+    monkeypatch.setattr(bot_module, "SessionLocal", TestingSessionLocal)
+    monkeypatch.setattr(bot_module, "sync_playwright", lambda: _FakeSyncPlaywright("https://myaccount.google.com/"))
+    monkeypatch.setattr(bot_module.logger, "info", recording_info)
+
+    run_health_check_mode(_settings_stub())
+
+    assert steps == ["launching_chromium", "navigating", "checking_signed_in"]
+
+
+# --- stale profile lock hygiene (item 3) -------------------------------------
+
+
+def test_remove_singleton_lock_files_removes_existing_files_and_reports_them(tmp_path):
+    (tmp_path / "SingletonLock").write_text("stale")
+    (tmp_path / "SingletonCookie").write_text("stale")
+    # SingletonSocket deliberately absent — must not error on a partial set.
+
+    removed = _remove_singleton_lock_files(str(tmp_path))
+
+    assert sorted(removed) == ["SingletonCookie", "SingletonLock"]
+    assert not (tmp_path / "SingletonLock").exists()
+    assert not (tmp_path / "SingletonCookie").exists()
+
+
+def test_remove_singleton_lock_files_is_a_no_op_when_nothing_there(tmp_path):
+    assert _remove_singleton_lock_files(str(tmp_path)) == []
+
+
+def test_clear_stale_profile_lock_removes_files(tmp_path):
+    (tmp_path / "SingletonLock").write_text("stale")
+    _clear_stale_profile_lock(str(tmp_path))  # must not raise
+    assert not (tmp_path / "SingletonLock").exists()
+
+
+def test_clear_stale_profile_lock_for_account_clears_when_not_in_use(db_session, tmp_path):
+    account = BotAccount(email="a@example.com", profile_path=str(tmp_path), status=BotAccountStatus.FREE)
+    db_session.add(account)
+    db_session.commit()
+    (tmp_path / "SingletonLock").write_text("stale")
+
+    _clear_stale_profile_lock_for_account(db_session, account)
+
+    assert not (tmp_path / "SingletonLock").exists()
+
+
+def test_clear_stale_profile_lock_for_account_leaves_a_genuinely_in_use_account_alone(db_session, tmp_path):
+    """The pool's in_use status is the source of truth — a lock held by a
+    real, currently-running bot must never be touched."""
+    account = BotAccount(email="a@example.com", profile_path=str(tmp_path), status=BotAccountStatus.IN_USE)
+    db_session.add(account)
+    db_session.commit()
+    (tmp_path / "SingletonLock").write_text("a real, live lock")
+
+    _clear_stale_profile_lock_for_account(db_session, account)
+
+    assert (tmp_path / "SingletonLock").exists()

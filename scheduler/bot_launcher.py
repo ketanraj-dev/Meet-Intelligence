@@ -71,12 +71,16 @@ def _bot_environment(settings: Settings, meeting_id) -> dict:
     return env
 
 
-def launch_container(settings: Settings, meeting_id) -> None:
-    """Uses the low-level API (create_host_config + create_container +
-    start), not the containers.run() convenience wrapper. run() silently
-    rejects stop_timeout — confirmed live: `TypeError: run() got an
-    unexpected keyword argument 'stop_timeout'` — because docker-py's run()
-    only forwards kwargs listed in its own RUN_CREATE_KWARGS/
+def _run_bot_container(settings: Settings, container_name: str, environment: dict) -> None:
+    """Shared by launch_container (a real meeting) and
+    launch_health_check_container (a one-shot account health check) — both
+    just run the same `bot` image with different env vars/BOT_MODE.
+
+    Uses the low-level API (create_host_config + create_container + start),
+    not the containers.run() convenience wrapper. run() silently rejects
+    stop_timeout — confirmed live: `TypeError: run() got an unexpected
+    keyword argument 'stop_timeout'` — because docker-py's run() only
+    forwards kwargs listed in its own RUN_CREATE_KWARGS/
     RUN_HOST_CONFIG_KWARGS allowlists, and stop_timeout is in neither
     (checked against the installed docker-py directly). The low-level
     create_container() genuinely supports stop_timeout (it maps straight to
@@ -99,7 +103,6 @@ def launch_container(settings: Settings, meeting_id) -> None:
         raise RuntimeError("HOST_PROJECT_DIR is not set — cannot bind-mount volumes for an auto-launched bot")
 
     client = docker.from_env()
-    container_name = f"meet-bot-{meeting_id}"
     volumes = {
         f"{settings.host_project_dir}/bot-profiles": {"bind": "/bot-profiles", "mode": "rw"},
         f"{settings.host_project_dir}/recordings": {"bind": "/recordings", "mode": "rw"},
@@ -117,13 +120,38 @@ def launch_container(settings: Settings, meeting_id) -> None:
         image=settings.bot_image,
         name=container_name,
         detach=True,
-        environment=_bot_environment(settings, meeting_id),
+        environment=environment,
         volumes=[v["bind"] for v in volumes.values()],
         host_config=host_config,
         stop_timeout=settings.bot_stop_timeout_seconds,
     )
     client.api.start(container=container["Id"])
+
+
+def launch_container(settings: Settings, meeting_id) -> None:
+    container_name = f"meet-bot-{meeting_id}"
+    _run_bot_container(settings, container_name, _bot_environment(settings, meeting_id))
     logger.info("bot_container_launched", meeting_id=str(meeting_id), container=container_name)
+
+
+def _health_check_environment(settings: Settings, account_id) -> dict:
+    env = {k.upper(): str(v) for k, v in settings.model_dump().items() if v is not None}
+    env["BOT_ACCOUNT_ID"] = str(account_id)
+    env["BOT_MODE"] = "health_check"
+    return env
+
+
+def launch_health_check_container(settings: Settings, account_id) -> None:
+    """One-shot: opens the account's saved profile, checks it's still
+    signed in to Google, writes the result back onto bot_accounts, exits.
+    Caller (scheduler/health_check.py) is responsible for only calling this
+    for a currently-*idle* account — running this against an IN_USE
+    account would launch a second Chromium against the same profile
+    directory a real meeting bot already has open, which Chrome's own
+    SingletonLock on the profile dir would reject outright."""
+    container_name = f"meet-bot-healthcheck-{account_id}"
+    _run_bot_container(settings, container_name, _health_check_environment(settings, account_id))
+    logger.info("bot_account_health_check_launched", account_id=str(account_id), container=container_name)
 
 
 def _handle_launch_failure(db: Session, meeting: Meeting, error: str) -> None:

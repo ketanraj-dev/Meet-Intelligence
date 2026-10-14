@@ -35,7 +35,10 @@ def list_accounts() -> None:
             print(
                 f"{account.email}\t{account.status}\t"
                 f"meeting={account.current_meeting_id}\t"
-                f"last_heartbeat={account.last_heartbeat_at}"
+                f"last_heartbeat={account.last_heartbeat_at}\t"
+                f"last_used={account.last_used_at}\t"
+                f"last_health_check={account.last_health_check_at}\t"
+                f"needs_relogin={account.needs_relogin}"
             )
     finally:
         db.close()

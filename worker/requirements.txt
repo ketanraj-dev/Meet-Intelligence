@@ -1,0 +1,40 @@
+# torch 2.1.1's compiled extensions were built against the NumPy 1.x ABI —
+# confirmed live that letting pip resolve the latest NumPy (2.x) pulls in
+# an ABI mismatch (warnings at best, "may crash" per NumPy's own message,
+# a real torchaudio import failure in practice). Pin below 2.
+numpy<2
+
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+pydantic-settings>=2.4
+python-dotenv>=1.0
+boto3>=1.34
+structlog>=24.1
+redis>=5.0
+
+# CPU-only torch build — much smaller download than the default CUDA
+# wheels, appropriate for the current CPU-only testing setup. Switching to
+# GPU later (DIARIZATION_DEVICE=cuda) needs a different wheel here, not a
+# code change — see common/config.py's diarization_device.
+#
+# torch/torchaudio pinned together, exactly, not just floor-bounded:
+# confirmed live that an unpinned install pulls torch 2.14.1 +
+# torchaudio 2.11.0 (not even matching each other's minor version), and
+# pyannote.audio 3.1.1 calls torchaudio.set_audio_backend(...), an API
+# torchaudio removed well before 2.11 — AttributeError at import time,
+# every job. 2.1.1/2.1.1 is the combo pyannote.audio 3.1.x was actually
+# built and tested against.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.1
+torchaudio==2.1.1
+
+# pyannote/speaker-diarization-3.1 needs pyannote.audio 3.1.x specifically
+# (the pipeline's config pins compatible component versions internally).
+pyannote.audio>=3.1,<3.2
+
+# pyannote.audio 3.1.1's Pipeline.from_pretrained() only ever calls
+# hf_hub_download(..., use_auth_token=...) — that kwarg was removed from
+# newer huggingface_hub (confirmed live: TypeError, unpinned pip resolved
+# huggingface_hub 2.2.0). Pin to a version from pyannote.audio 3.1's own
+# era that still accepts it.
+huggingface_hub==0.25.2

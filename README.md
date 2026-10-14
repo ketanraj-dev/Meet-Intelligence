@@ -1,13 +1,72 @@
 # Meet Intelligence
 
-Automatically joins Google Meet calls via a server-side bot, records them, transcribes
-them (multilingual, Indian languages + Hinglish), and runs sentiment analysis +
-summarization.
+Automatically joins Google Meet calls via a server-side bot, records them, diarizes and
+transcribes them (multilingual, Indian languages + Hinglish), and saves the transcript
+as a Google Doc. Sentiment analysis and an LLM-generated summary are planned but
+currently paused — see "Plan (current)" below.
 
-No Google Workspace / Meet / Drive APIs are used anywhere in this system. Capture is
-done by a headless-Chrome bot joining as a normal participant.
+No Google Workspace / Meet APIs are used for **capture** — the bot joins and records as
+a normal headless-Chrome participant, not via any Meet API. Docs + Drive APIs *are*
+used, narrowly, for the transcript-export phase only (Phase 5) — a domain-wide-delegated
+service account creates one Doc per meeting; see that phase's spec below.
 
 This README grows one section per phase.
+
+---
+
+## Plan (current)
+
+**Scope change:** sentiment analysis and the LLM-generated summary are paused — kept
+documented here as a deferred future phase, not being built right now. The goal through
+Phase 5 is: recording → diarization → transcription → transcript saved as a Google Doc.
+Phases 1 and 2 (below) are unaffected and already done.
+
+- **Phase 1 — Foundation** ✅ done. Bot account pool, Meeting/Participant schema, API,
+  Google Calendar trigger.
+- **Phase 2 — The meeting bot** ✅ done. Headless-Chrome join/record/leave, debounced
+  speaker events, account rotation + weekly health check.
+- **Phase 3 — Diarization + speaker naming** (next — kickoff message to follow
+  separately). Turns `speakers.jsonl`'s participant join/leave + debounced
+  speaking_start/stop events, plus the recorded audio, into labeled speaker segments.
+- **Phase 4 — Transcription**. Indic-Transcribe (multilingual/Hinglish) with Whisper as
+  fallback. Must run on CPU for local testing (slow is fine) — GPU support is a config
+  switch added later, not a rewrite.
+- **Phase 5 — Google Docs export only**. Originally spec'd bundled with sentiment +
+  summary at the end of that phase; now its own phase, with the sentiment/summary
+  content dropped from the Doc. Full spec below.
+- **Deferred — Sentiment analysis + LLM summary**. Not scheduled. No phase number
+  assigned yet — Phase 6 is already used below for the dashboard and Phase 7 for
+  hardening/auth, so this will need to either slot in after Phase 5 (renumbering those
+  two) or take whichever phase number is next free when it's picked back up.
+
+### Phase 5 spec — Google Docs transcript export
+
+- **Trigger**: once transcription (Phase 4) finishes for a meeting, create one Google
+  Doc for it.
+- **Auth**: Docs (`documents`) + Drive (`drive.file`) scopes via the same service
+  account + domain-wide delegation already used for Calendar sync (see
+  `calendar_sync/auth.py`'s `ServiceAccountDWDProvider`), impersonating
+  `it@fincelerate.com`. Per the user, these scopes are already granted in the Workspace
+  Admin console's domain-wide delegation grant alongside the existing Calendar ones.
+- **Title**: `"Appointment – <Client> – <date, time IST>"`.
+- **Content**: a header (host, client name/email, date/time IST, duration, languages
+  detected) followed by the full transcript as `[hh:mm:ss] Speaker (role): text`, with
+  overlapping speech marked. No summary or sentiment content in the Doc — that's the
+  deferred phase above.
+- **Folder**: `GOOGLE_DOC_FOLDER_ID` (already set in `.env` — a folder the user created
+  by hand in `it@`'s Drive). **Open risk, test early**: with `drive.file` scope, the app
+  may not be allowed to place files into a folder it didn't itself create. If that's
+  the case live, fall back to the app creating its own "Meeting Transcripts" folder in
+  `it@`'s Drive, store that folder's ID, and tell the user so they can share it with
+  their team — do not request the full `drive` scope to work around this.
+- **Sharing**: restricted, inherited from the folder. Never anyone-with-link.
+- **Persistence**: `google_doc_id` and `google_doc_url` stored on `meetings`. Status
+  flow: `transcribing → exporting → done`, with a separate `export_failed` status
+  (retries) that never blocks or loses the already-computed transcript — Postgres
+  (`transcript_segments`) stays the source of truth; the Doc is a generated,
+  read-only export.
+- **Idempotent**: re-running the export updates the existing Doc via its stored
+  `google_doc_id`, never creates a duplicate.
 
 ---
 
@@ -876,3 +935,290 @@ actively matching mid-utterance in a captured screenshot — every debug capture
 happened to land on a silent instant. The live test above confirms it works in
 practice (both participants produced real speaking events), so this is now a
 theoretical/documentation gap, not a functional one.
+
+---
+
+## Bot pool: account rotation + weekly health check
+
+Two problems with a small, fixed pool of Gmail accounts: (1) always picking the
+same account first (e.g. lowest `id`) leaves the others idle, and an idle Google
+session can silently expire; (2) nothing ever checked whether a signed-in session
+was still actually valid until a real meeting tried to use it and failed to join.
+
+**Rotation**: `bot_accounts.last_used_at`, set only at checkout (not reservation,
+not release). Both `reserve_account` and `checkout_account`'s fallback path order
+candidates by `last_used_at ASC NULLS FIRST` instead of a fixed `id` order — a
+never-used account always goes first, otherwise whichever has sat idle longest.
+
+**Weekly health check**: a 4th scheduler thread (`scheduler/health_check.py`) polls
+hourly for any currently-*idle* (`status=free`) account whose `last_health_check_at`
+is unset or older than `BOT_HEALTH_CHECK_INTERVAL_SECONDS` (default 7 days), and
+launches a one-shot `BOT_MODE=health_check` bot container per due account — **never**
+against an `in_use` account, since a second Chromium against the same profile
+directory would collide with the real bot's own instance on Chrome's `SingletonLock`.
+
+That container (`run_health_check_mode` in `bot/bot.py`) opens the account's saved
+profile with real Playwright (no credential entry happens, so none of
+`run_login_mode`'s automation-detection concerns apply), navigates to
+`myaccount.google.com`, and checks whether it got redirected to Google's own sign-in
+page. The actual check runs in a background thread joined against a hard
+`BOT_HEALTH_CHECK_RUN_TIMEOUT_SECONDS` ceiling (default 90s) — confirmed live that a
+stale profile lock can otherwise hang this far longer with nothing to show for it; a
+stuck run is simply abandoned (daemon thread) rather than waited out. Each step
+(`launching_chromium` / `navigating` / `checking_signed_in`) is logged individually,
+and a screenshot is saved locally (under `<recordings_dir>/health_checks/<account_id>/`)
+whenever the check itself fails partway through — a useful artifact for a human
+investigating why one account keeps coming back inconclusive. The result lands on
+`bot_accounts.last_health_check_at` / `needs_relogin` (and is exposed via
+`GET /bot-accounts`) — `needs_relogin=true` is the alert signal, same convention as
+`NO_BOT_AVAILABLE`/`bot_launch_failed_permanently` elsewhere in this project (no
+outbound webhook channel exists yet). A failed or timed-out check is treated as
+*inconclusive*, not proof the session is broken — it keeps whatever `needs_relogin`
+value was already there rather than guessing from a transient failure.
+
+**Manual run** (to check one account by hand, outside the weekly schedule):
+
+```bash
+docker compose run --rm -e BOT_MODE=health_check -e BOT_ACCOUNT_EMAIL=notetaker1@gmail.com bot
+# or, if you already have the UUID:
+docker compose run --rm -e BOT_MODE=health_check -e BOT_ACCOUNT_ID=<uuid> bot
+```
+
+`python -m bot_pool.cli list` now also prints `last_used`, `last_health_check`, and
+`needs_relogin` for each account, so a quick glance shows both rotation health and
+whether anything needs a manual re-login (`docker compose run --rm -d -p 5900:5900 -e
+BOT_MODE=login -e BOT_PROFILE_PATH=<profile> bot`, same as initial setup).
+
+**Stale profile locks**: confirmed live — an old `login`-mode container that didn't
+exit cleanly left a `SingletonLock` in notetaker1's profile dir ("profile in use by
+another Chromium process on another computer `<hostname>`"), which made the *next*
+launch against that profile (a health check) hang for the full old timeout instead of
+just failing fast. Chromium only removes `SingletonLock`/`SingletonCookie`/
+`SingletonSocket` on a clean exit — a SIGKILL, an OOM, or a crashed container all skip
+that cleanup, and a container that didn't get `stop_grace_period`'d cleanly leaves the
+lock behind for the next launch to trip over. Fixed two ways:
+- **Before launching Chromium in any mode** (`run`, `login`, `health_check`), any
+  existing lock file is cleared first — logged as `stale_profile_lock_cleared` — as
+  long as it's actually safe: the bot pool's own `in_use` status is the source of
+  truth for who's legitimately allowed to hold a profile right now. `run` mode's
+  checkout already proved exclusive ownership (row-locked), so it clears
+  unconditionally; `login`/`health_check` modes re-check the account's current status
+  and leave a genuinely `in_use` account's lock alone.
+- **`login` mode now force-clears the lock after shutdown**, not just relies on
+  Chromium's own cleanup — if the 10s graceful-SIGTERM window expires and it has to
+  SIGKILL, Chromium never gets the chance to clean up after itself; this guarantees
+  the profile is left clean for the next launch either way.
+
+**Postgres healthcheck fix**: `docker-compose.yml`'s `postgres` healthcheck was
+running `pg_isready -U ${POSTGRES_USER:-meet}` with no `-d` — confirmed via `psql -l`
+that no database literally named `meet` exists (only `meet_intelligence`), so it
+wasn't actually checking connectivity to the database every other service's
+`DATABASE_URL` depends on. Added `-d ${POSTGRES_DB:-meet_intelligence}`.
+
+---
+
+## Phase 3 — Diarization + speaker naming
+
+**What's built:** a new `worker/` service (own `Dockerfile`/`requirements.txt`,
+mirroring `bot/`'s pattern) that consumes the Redis queue `enqueue_processing`
+(Phase 2) pushes to. For each `recorded` meeting: downloads and concatenates all its
+audio segments (plain stdlib `wave`, no ffmpeg needed), runs
+`pyannote/speaker-diarization-3.1` on CPU, maps pyannote's anonymous clusters
+(`SPEAKER_00`, ...) to real participant names by total time-overlap against
+`speakers.jsonl`'s debounced `speaking_start`/`speaking_stop` intervals (same `t`
+clock as the WAV), resolves overlapping speech to a single dominant speaker per
+region, merges/splits into Phase-4-ready turns (same-speaker gaps < 0.5s merged,
+turns > 30s split at the quietest ≥250ms silence point found, else a hard cut), and
+writes them to a new `speaker_turns` table — idempotent (replaces, never
+duplicates). Status: `recorded → diarizing → diarized` (or `failed`, with up to 3
+retries — `worker/main.py`'s `_handle_meeting`, same convention as
+`bot_launcher.py`'s launch-retry logic from an earlier round).
+
+`worker/cli.py` gives `process-meeting <id>` (run/re-run one meeting directly,
+bypassing the queue) and `show-turns <id>` (print turns with names/times/confidence).
+
+**Real dependency/runtime bugs found and fixed getting this to actually run** (every
+one confirmed live, not guessed — this dependency stack has almost no margin for
+unpinned versions):
+- **`torch`/`torchaudio` version mismatch**: unpinned install resolved torch 2.14.1 +
+  torchaudio 2.11.0 (not even matching minor versions) — pyannote.audio 3.1.1 calls
+  `torchaudio.set_audio_backend(...)`, an API torchaudio removed well before 2.11.
+  Pinned both to `2.1.1`, the combo pyannote.audio 3.1.x was actually built against.
+- **NumPy 2.x ABI mismatch**: that same torch 2.1.1 build was compiled against the
+  NumPy 1.x ABI; letting pip resolve latest NumPy (2.x) broke torchaudio's compiled
+  extension at import. Pinned `numpy<2`.
+- **Missing `libgomp1`**: torchaudio's compiled extension needs the GNU OpenMP
+  runtime; `python:3.11-slim` doesn't ship it. Added to the Dockerfile's apt packages
+  (alongside `libsndfile1` for `soundfile`, pyannote's audio-loading backend).
+- **`huggingface_hub` removed `use_auth_token`**: pyannote.audio 3.1.1's
+  `Pipeline.from_pretrained(..., use_auth_token=...)` forwards that exact kwarg name
+  to `hf_hub_download()`, which a current `huggingface_hub` no longer accepts
+  (`token=` now). Pinned `huggingface_hub==0.25.2`, from pyannote.audio 3.1's own era.
+- **OOM on a single ~2-minute meeting**: pyannote's own default `segmentation_batch_size`/
+  `embedding_batch_size` (32) spiked the worker container from ~0.8GB to 5GB+
+  resident memory within two seconds and got SIGKILLed (confirmed live, repeatedly,
+  with `docker stats` sampled every second during the spike). `diarization_batch_size`
+  (new setting, default `1`) fixed it outright — slower per job, not faster, but it
+  actually completes instead of dying; appropriate for "CPU, slow is fine" per the
+  current testing setup. Also added `torch.set_num_threads(1)` and
+  `OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1` (the BLAS thread pools torch's own setting
+  doesn't fully control) as belt-and-suspenders against the same class of spike.
+- Added a persistent `worker_model_cache` volume (`/root/.cache`) — without it, every
+  `docker compose run --rm worker ...` CLI invocation (a fresh, disposable container)
+  re-downloads the model from HF from scratch.
+
+**Validated live** on two real recorded meetings:
+- `0185a061-3954-48e6-a462-c1073389d1e9` (129s audio): 9 turns, pyannote took 294s
+  (~2.3x realtime, CPU). Only one participant ("Ketan Raj") ever had logged
+  `speaking_start`/`speaking_stop` events in this meeting's `speakers.jsonl` — the
+  other participant simply has none on record — so every pyannote cluster correctly
+  had only one real candidate to map against; confidence scores (0.19–0.76, never
+  forced to 1.0) honestly reflect that pyannote found more speech than the two known
+  intervals cover, rather than claiming false certainty.
+- `e140849a-6c26-4130-828d-b47a9990e7a1` (229s audio): 13 turns, pyannote took 519.7s
+  (~2.3x realtime). `speakers.jsonl` has real logged speaking data for *both*
+  participants here (44 events for "Information Technology", 50 for "Ketan Raj"), but
+  pyannote's own clustering found essentially one dominant voice cluster
+  (`SPEAKER_00`, correctly mapped to "Information Technology") plus a handful of
+  very short stray `SPEAKER_01` blips that didn't overlap enough with anyone to map
+  confidently (`Unknown speaker 1`) — confirmed by inspecting pyannote's raw output
+  directly, independent of this project's own mapping code. Per the user: in most of
+  this test recording, one person was speaking from *both* Meet devices/tiles, so a
+  single dominant acoustic voice is the correct real-world answer here, not a
+  diarization failure — this meeting isn't a clean two-distinct-voices accuracy test.
+  **Not yet validated**: name-mapping accuracy on a recording with two genuinely
+  distinct human voices overlapping/alternating throughout, which neither available
+  meeting actually provides.
+
+**Known limitation to flag**: the bot records `meet_sink.monitor` — the single
+mixed-down stereo-to-mono output of everyone's audio as the bot hears it, not
+per-participant tracks. pyannote's acoustic clustering accuracy on a *real* multi-voice
+call therefore depends entirely on how distinguishable the voices are in that one mixed
+stream — something only a genuine multi-voice test recording can actually validate.
+
+**Open items for you / future rounds:**
+1. CPU diarization runs at ~2.3x realtime here — a real multi-minute meeting will take
+   multiple times its own length to diarize. `DIARIZATION_DEVICE=cuda` is wired as a
+   config switch (not a rewrite) for whenever a GPU host is available, per the
+   original ask — just not exercised live yet (no GPU in this environment).
+2. `worker`'s retry backoff (`RETRY_BACKOFF_SECONDS = 10`) is a plain `time.sleep` in
+   the failure handler, not a separate scheduling thread — fine at today's volume, may
+   want revisiting if the queue ever gets busy enough for that to matter.
+3. `speaker_turns.participant_id` deliberately is NOT a foreign key to `participants`
+   (calendar-invite identities) — it's the raw Meet-session participant id from
+   `speakers.jsonl`. See the model's own docstring in `common/models.py` for why.
+
+## Phase 4 — Transcription
+
+**What's built:** a new `asr/` service (own `Dockerfile`/`requirements.txt`,
+deliberately a separate container/process/queue from `worker/` — pyannote and the ASR
+backends must never be loaded in the same process at once, see
+`asr/transcription.py`'s module docstring) that consumes `enqueue_transcription`
+(pushed by `worker/main.py` right after a meeting's diarization succeeds). For each
+`diarized` meeting: decides a language **per speaker** (not per clip — majority vote
+of faster-whisper's language ID across that speaker's 3 longest turns, normalizing
+Hindi-confusable results `ur`/`mai`/`bho` to `hi`; `expected_languages` on the meeting
+overrides LID entirely), transcribes every turn with `IndicTranscribeASR`
+(`bodhan-ai/indic-transcribe-flex`) when the decided language is one of its 27, else
+`WhisperASR` (faster-whisper, CPU, `small` model for testing), and writes
+`transcript_segments` — idempotent (delete-then-insert, replaces, never duplicates).
+Status: `diarized → transcribing → transcribed` (or `failed`, up to 3 retries, same
+convention as `worker/main.py`'s `_handle_meeting`).
+
+`asr/cli.py` gives `transcribe-meeting <id>` (`--limit N` to transcribe only the first
+N turns for a quick check without replacing the full transcript — logs a warning that
+it's a partial replace) and `show-transcript <id>` (prints
+`[hh:mm:ss] Speaker (role): text`, with an `[overlap]` marker carried over from
+diarization).
+
+**Credit (per the Indic Open Model License):**
+
+> Built with Indic-Transcribe from Bodhan AI / AI4Bharat.
+
+Self-hosted for this project's own internal use only — not exposed as an API for
+third parties, per the license's "ask before hosting it for others" condition.
+
+**Real bugs found and fixed getting this to actually run:**
+- **Wrong integration pattern entirely**: the original implementation called
+  `transformers.pipeline("automatic-speech-recognition", model=..., trust_remote_code=True)`,
+  built on the standard Whisper-family HF pattern since there was no internet access
+  to confirm the real API at implementation time. On first real run this failed
+  (`ValueError: ... contains custom code which must be executed...`, then even with
+  `trust_remote_code=True`, `Couldn't instantiate the backend tokenizer... need
+  sentencepiece or tiktoken`). Fetching the model repo's own `README.md`/`inference.py`/
+  `indic_transcribe.py` directly from the Hub revealed it isn't a
+  `pipeline()`-compatible model at all — it ships its own `IndicTranscribe` class with
+  a custom dual-SentencePiece tokenizer that loads files via `os.path.join` and
+  therefore needs a real local directory, not a Hub repo id or `AutoTokenizer`'s
+  dynamic-class resolution. Fixed by `snapshot_download`-ing the whole repo, putting
+  it on `sys.path`, and importing the repo's own `IndicTranscribe.from_pretrained(...)`
+  directly (`asr/transcription.py`'s `IndicTranscribeASR._pipeline()`). This also
+  surfaced the model's *real* 27-language list and `MODES` dict straight from its
+  source — replacing the task spec's best-effort guess in `common/config.py`.
+- **Missing `sentencepiece`**: the custom tokenizer needs it to load two `.model`
+  files directly (not a `tokenizers`-library fast-tokenizer file). Added to
+  `asr/requirements.txt`.
+- **Missing `torchaudio`**: the model's own audio-loading code resamples with it when
+  a clip's sample rate doesn't match the model's expected rate. Added.
+- **ASR container pinned to 1 CPU thread, using only 1 of 10 available Docker Desktop
+  cores**: `OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1` and `torch.set_num_threads(1)` were
+  copied over from `worker/Dockerfile`'s pyannote-specific OOM fix (Phase 3) without
+  rethinking them for this container's own memory headroom — confirmed live via
+  `docker stats` (99% CPU on one core, 6.3/10.7GiB memory sitting unused). Fixed with a
+  new `ASR_NUM_THREADS` setting (default 8, leaves 2 cores for macOS + other
+  containers) threaded into both `torch.set_num_threads()` (`IndicTranscribeASR`) and
+  faster-whisper's `cpu_threads=` (`WhisperASR`), plus the matching
+  `OMP_NUM_THREADS`/`MKL_NUM_THREADS` env vars moved from the Dockerfile into
+  `docker-compose.yml`'s `asr` service so they're configurable without a rebuild.
+  `worker`'s diarization thread pinning is untouched — that OOM fix was for a
+  different model/container and still applies there.
+
+**Validated live** on two real diarized meetings (8 threads, CPU):
+- `4b08e233-fd3c-4277-b243-ab93b3f5f9cd` (Hindi/English mixed, 12 turns): full
+  transcription took 71.6s (~6s/turn average) after the thread fix, down from 516s
+  single-threaded (~24s/turn) before it. `docker stats` showed 700-770% CPU (7-7.7 of
+  the configured 8 cores) and ~1GB memory peak — nowhere near the 10.7GB available.
+- `e140849a-6c26-4130-828d-b47a9990e7a1` (English, 7 turns): 64.6s (~9s/turn average).
+
+**Known accuracy issue — per-speaker language decision on code-switching speakers:**
+on `4b08e233`, both speakers were decided as `used=en` (majority vote of faster-whisper
+LID across each speaker's 3 longest turns). For "Information Technology" that's
+correct — their speech is genuinely English throughout. For "Ketan Raj" it's wrong for
+part of their turns: he code-switches between Hindi and English mid-conversation, and
+whichever language happened to dominate his *longest* sampled turns won the vote for
+*all* of his turns. The Hindi turns, transcribed under English mode, come out as
+garbled near-nonsense rather than correct Devanagari+Latin mixed-script output, e.g.:
+  - `"Test karne ke liye kuch to go lage haan Teera awaaz nahi aa raha hai"`
+  - `"Are you matlab voice zero per Above allah"`
+  - `"But sir voice direct directoration use kare taki different voices test kar sake wo"`
+  This is the per-speaker (not per-clip) design working exactly as specified — the
+  spec explicitly chose one decision per speaker over one per turn — but it has a real
+  failure mode on a speaker who code-switches, which neither of this session's two test
+  meetings' *other* speaker exercises (both "Information Technology"/this meeting's
+  second speaker are single-language throughout). Worth you deciding whether to accept
+  this tradeoff, move the language decision to per-turn (slower — doubles LID calls),
+  or treat code-switching as a flag to route to Whisper instead. Two turns on this same
+  meeting (`00:00:58` and `00:01:19`) also show severe ASR repetition-loop
+  hallucination (`"Hello"` and `"ha ha"` repeated 50-150+ times) — a known failure mode
+  of this model family on low-signal/edge-of-speech audio (see its own README: "a
+  single decoding pass collapses into repetition" past its training distribution);
+  worth checking whether those specific turns are mostly silence/noise.
+- One line of `4b08e233`'s transcript (Ketan Raj, `00:01:15.790`) is redacted
+  (`REDACTED`) in this chat's own display — Claude's output filter, not something
+  stored that way in the database — check that segment directly via `show-transcript`
+  in your own terminal if you want to see it.
+- `e140849a`'s transcript is clean throughout (all genuinely English, coherent, no
+  repetition or language-mismatch issues) — confirms the pipeline mechanics are sound;
+  the issue above is specifically about the per-speaker LID design, not a bug in the
+  transcription/storage/CLI plumbing.
+
+**Open items for you / future rounds:**
+1. The per-speaker code-switching accuracy issue above.
+2. `IndicTranscribeASR`'s wrapper (per its own docstring) decodes whole clips and
+   degrades past ~30s (training `max_duration`); this project's turns are already
+   capped at `diarization_max_turn_seconds=30.0` from Phase 3, so the repo's own
+   `long_form`/chunking path was never needed here — but worth keeping in mind if that
+   cap ever changes.
+3. `TRANSCRIPTION_DEVICE=cuda` is wired as a config switch (not a rewrite) for
+   whenever a GPU host is available — not exercised live yet (no GPU in this
+   environment).

@@ -64,6 +64,99 @@ def test_checkout_falls_back_to_any_free_account_when_none_reserved(db_session):
     assert checked_out.current_meeting_id == meeting.id
 
 
+# --- LRU rotation (item 6) ------------------------------------------------------
+
+
+def test_checkout_fallback_prefers_never_used_account_over_a_used_one(db_session):
+    used = BotAccount(
+        email="used@example.com", profile_path="/p/used", last_used_at=datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    never_used = BotAccount(email="never-used@example.com", profile_path="/p/never-used")
+    db_session.add_all([used, never_used])
+    meeting = _make_meeting(db_session)
+    db_session.commit()
+
+    checked_out = checkout_account(db_session, meeting)
+    db_session.commit()
+
+    assert checked_out.email == "never-used@example.com"
+
+
+def test_checkout_fallback_prefers_the_least_recently_used_account(db_session):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    recently_used = BotAccount(email="recent@example.com", profile_path="/p/recent", last_used_at=now)
+    long_idle = BotAccount(
+        email="idle@example.com", profile_path="/p/idle", last_used_at=now - timedelta(days=10)
+    )
+    db_session.add_all([recently_used, long_idle])
+    meeting = _make_meeting(db_session)
+    db_session.commit()
+
+    checked_out = checkout_account(db_session, meeting)
+    db_session.commit()
+
+    assert checked_out.email == "idle@example.com"
+
+
+def test_checkout_sets_last_used_at(db_session):
+    account = BotAccount(email="a@example.com", profile_path="/p/a")
+    db_session.add(account)
+    meeting = _make_meeting(db_session)
+    db_session.commit()
+
+    assert account.last_used_at is None
+    checked_out = checkout_account(db_session, meeting)
+    db_session.commit()
+
+    assert checked_out.last_used_at is not None
+
+
+def test_checkout_rotates_across_accounts_release_then_release(db_session):
+    """The actual rotation property this was built for: repeatedly
+    checking out and releasing never piles every meeting onto the same
+    account — each checkout picks whichever account has sat idle longest,
+    so both accounts' Google sessions stay exercised."""
+    account_a = BotAccount(email="a@example.com", profile_path="/p/a")
+    account_b = BotAccount(email="b@example.com", profile_path="/p/b")
+    db_session.add_all([account_a, account_b])
+    db_session.commit()
+
+    seen_emails = []
+    for i in range(3):
+        meeting = _make_meeting(db_session, meet_url=f"https://meet.google.com/rot-000{i}-rot")
+        db_session.commit()
+        checked_out = checkout_account(db_session, meeting)
+        db_session.commit()
+        seen_emails.append(checked_out.email)
+        release_account(db_session, checked_out.id)
+        db_session.commit()
+
+    # Alternates a/b/a (or b/a/b) — never the same account twice in a row.
+    assert seen_emails[0] != seen_emails[1]
+    assert seen_emails[1] != seen_emails[2]
+
+
+def test_reserve_account_candidate_order_is_also_least_recently_used(db_session):
+    """reserve_account picks the account a future meeting will eventually
+    use — it has to honor the same rotation, or a meeting booked today for
+    next week would always land on whichever account sorts first by id,
+    defeating the rotation the moment real scheduling (not just immediate
+    checkout) is involved."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    recently_used = BotAccount(email="recent@example.com", profile_path="/p/recent", last_used_at=now)
+    long_idle = BotAccount(
+        email="idle@example.com", profile_path="/p/idle", last_used_at=now - timedelta(days=10)
+    )
+    db_session.add_all([recently_used, long_idle])
+    meeting = _make_meeting(db_session, scheduled_at=now + timedelta(days=3))
+    db_session.commit()
+
+    reserved = reserve_account(db_session, meeting)
+    db_session.commit()
+
+    assert reserved.email == "idle@example.com"
+
+
 def test_checkout_fallback_skips_account_with_overlapping_reservation(db_session):
     account1 = BotAccount(email="a@example.com", profile_path="/p/a")
     account2 = BotAccount(email="b@example.com", profile_path="/p/b")

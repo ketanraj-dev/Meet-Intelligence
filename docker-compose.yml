@@ -10,7 +10,13 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meet}"]
+      # -d matters: without it, pg_isready checks connectivity to a
+      # database named after the user (POSTGRES_USER, "meet") rather than
+      # the actual app database (POSTGRES_DB, "meet_intelligence") that
+      # DATABASE_URL below actually connects to — a healthy check here
+      # wasn't proving the thing every other service's `depends_on:
+      # condition: service_healthy` actually needs.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meet} -d ${POSTGRES_DB:-meet_intelligence}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -123,6 +129,76 @@ services:
       - ./bot-profiles:/bot-profiles
       - ./recordings:/recordings
 
+  # Phase 3: diarization worker. Consumes the Redis queue bot.py's
+  # enqueue_processing pushes to (meeting ends -> recorded -> queued).
+  # CPU-only for now (DIARIZATION_DEVICE in .env switches to GPU later —
+  # a config change, not a rebuild, though GPU passthrough itself isn't
+  # wired into this compose file yet since there's no GPU host to test
+  # against). No docker.sock needed — unlike scheduler, this never
+  # launches other containers.
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-meet}:${POSTGRES_PASSWORD:-meet}@postgres:5432/${POSTGRES_DB:-meet_intelligence}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: storage:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+      # Persists the downloaded pyannote/HF model across restarts AND
+      # across `docker compose run --rm worker ...` CLI invocations (each
+      # of those is a fresh, disposable container — without this the
+      # model would re-download from HF every single manual
+      # process-meeting run).
+      - worker_model_cache:/root/.cache
+    command: python -m worker.main
+
+  # Phase 4: transcription worker. Consumes the transcription queue
+  # worker's diarization pushes to on success. Deliberately a SEPARATE
+  # container/process from `worker` above — see
+  # asr/transcription.py's module docstring (pyannote and the ASR
+  # backends here must never be loaded in the same process at once).
+  asr:
+    build:
+      context: .
+      dockerfile: asr/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-meet}:${POSTGRES_PASSWORD:-meet}@postgres:5432/${POSTGRES_DB:-meet_intelligence}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: storage:8000
+      # Diarization (worker/Dockerfile) stays pinned to 1 thread — that's
+      # the pyannote-specific OOM fix from Phase 3. This container runs a
+      # completely separate process; confirmed live it was only using 1 of
+      # 10 available Docker Desktop cores (99% CPU on one core, 6.3/10.7GiB
+      # memory headroom unused) because these were hardcoded to 1 here too.
+      # ASR_NUM_THREADS (default 8, see common/config.py) leaves 2 cores
+      # for macOS + the other containers.
+      OMP_NUM_THREADS: ${ASR_NUM_THREADS:-8}
+      MKL_NUM_THREADS: ${ASR_NUM_THREADS:-8}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+      - asr_model_cache:/root/.cache
+    command: python -m asr.main
+
 volumes:
   postgres_data:
   minio_data:
+  worker_model_cache:
+  asr_model_cache:

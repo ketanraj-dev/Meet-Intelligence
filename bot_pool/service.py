@@ -24,7 +24,7 @@ request/transaction boundary; functions here only `flush()`.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import literal, select
+from sqlalchemy import literal, nulls_first, select
 from sqlalchemy.dialects.postgresql import TSTZRANGE, Range
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -66,8 +66,15 @@ def reserve_account(db: Session, meeting: Meeting) -> BotAccount | None:
         return db.get(BotAccount, existing.bot_account_id)
 
     window = _window_for_meeting(meeting, get_settings())
+    # Least-recently-*used* first (nulls — never yet checked out — first of
+    # all), not a fixed id order, so reservations rotate across every
+    # account rather than piling onto whichever one happens to sort first.
+    # last_used_at is only touched at checkout (see checkout_account), not
+    # here — reserving doesn't itself constitute "use".
     candidates = db.scalars(
-        select(BotAccount).where(BotAccount.status != BotAccountStatus.DISABLED).order_by(BotAccount.id)
+        select(BotAccount)
+        .where(BotAccount.status != BotAccountStatus.DISABLED)
+        .order_by(nulls_first(BotAccount.last_used_at.asc()))
     ).all()
 
     for account in candidates:
@@ -155,6 +162,7 @@ def checkout_account(db: Session, meeting: Meeting) -> BotAccount | None:
             account.status = BotAccountStatus.IN_USE
             account.current_meeting_id = meeting.id
             account.last_heartbeat_at = _utcnow()
+            account.last_used_at = _utcnow()
             db.flush()
             logger.info(
                 "bot_account_checked_out_reserved", account_id=str(account.id), meeting_id=str(meeting.id)
@@ -175,7 +183,10 @@ def checkout_account(db: Session, meeting: Meeting) -> BotAccount | None:
     stmt = (
         select(BotAccount)
         .where(BotAccount.status == BotAccountStatus.FREE, ~overlap_exists)
-        .order_by(BotAccount.id)
+        # Same least-recently-used rotation as reserve_account's candidate
+        # order — keeps every account's Google session exercised instead
+        # of always falling back to the same lowest-id account.
+        .order_by(nulls_first(BotAccount.last_used_at.asc()))
         .with_for_update(skip_locked=True)
         .limit(1)
     )
@@ -186,6 +197,7 @@ def checkout_account(db: Session, meeting: Meeting) -> BotAccount | None:
     account.status = BotAccountStatus.IN_USE
     account.current_meeting_id = meeting.id
     account.last_heartbeat_at = _utcnow()
+    account.last_used_at = _utcnow()
     db.flush()
     logger.info("bot_account_checked_out_fallback", account_id=str(account.id), meeting_id=str(meeting.id))
     return account

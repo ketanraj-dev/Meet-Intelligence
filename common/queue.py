@@ -1,8 +1,11 @@
 """Minimal Redis queue producer.
 
-Phase 3 adds the real consumer (Celery or RQ, TBD — see the GPU-queue
-convention noted in the README). For now this just accumulates meeting_ids
-so nothing's lost once a worker exists to drain it.
+processing_queue_name (Phase 3's worker consumes it): pushed by bot.py
+after a meeting finishes recording. transcription_queue_name (Phase 4's
+asr worker consumes it): pushed by worker/main.py after diarization
+succeeds. Two separate queues/consumers on purpose — see
+asr/transcription.py's module docstring (pyannote and Indic-Transcribe/
+Whisper must not both be loaded in one container at peak).
 """
 import json
 import uuid
@@ -24,4 +27,10 @@ def _get_client() -> redis.Redis:
 def enqueue_processing(meeting_id: uuid.UUID) -> None:
     _get_client().lpush(
         get_settings().processing_queue_name, json.dumps({"meeting_id": str(meeting_id)})
+    )
+
+
+def enqueue_transcription(meeting_id: uuid.UUID) -> None:
+    _get_client().lpush(
+        get_settings().transcription_queue_name, json.dumps({"meeting_id": str(meeting_id)})
     )

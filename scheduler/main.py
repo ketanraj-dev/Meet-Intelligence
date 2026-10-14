@@ -1,8 +1,10 @@
 """Entry point for the `scheduler` container.
 
-Runs three independent background loops: the calendar poller, the bot-pool
-reaper, and the bot-launcher (launches one bot container per meeting at
-scheduled_at - BOT_LAUNCH_LEAD_SECONDS).
+Runs four independent background loops: the calendar poller, the bot-pool
+reaper, the bot-launcher (launches one bot container per meeting at
+scheduled_at - BOT_LAUNCH_LEAD_SECONDS), and the account health checker
+(launches a one-shot bot container per idle account roughly weekly to
+verify its saved Google session is still signed in).
 """
 import threading
 import time
@@ -13,6 +15,7 @@ from common.config import get_settings
 from common.db import SessionLocal
 from common.logging import configure_logging, get_logger
 from scheduler.bot_launcher import run_forever as run_bot_launcher
+from scheduler.health_check import run_forever as run_health_checker
 
 logger = get_logger(__name__)
 
@@ -53,6 +56,7 @@ def main() -> None:
     threading.Thread(target=run_calendar_poller, daemon=True, name="calendar-poller").start()
     threading.Thread(target=_run_reaper_forever, daemon=True, name="bot-pool-reaper").start()
     threading.Thread(target=run_bot_launcher, daemon=True, name="bot-launcher").start()
+    threading.Thread(target=run_health_checker, daemon=True, name="bot-account-health-checker").start()
 
     logger.info("scheduler_started")
     while True:

@@ -69,6 +69,24 @@ def db_session():
         session.close()
 
 
+def fresh_from_db(model, id_):
+    """For tests proving something was actually *committed* (not just
+    flushed/mutated in-memory) by reading it back through a brand new
+    session — same reasoning as test_scheduler_reaper.py's two-session
+    pattern. ALWAYS use this (or your own try/finally) instead of a bare
+    `TestingSessionLocal().get(...)`: an unclosed session leaves an
+    idle-in-transaction connection holding a lock, which can hang
+    `Base.metadata.drop_all()` in `_create_schema`'s teardown at the end of
+    the whole test session — confirmed live, and the hang is intermittent
+    (depends on whether Python's cyclic GC happens to collect the orphaned
+    Session first), which makes it a nasty one to debug blind later."""
+    session = TestingSessionLocal()
+    try:
+        return session.get(model, id_)
+    finally:
+        session.close()
+
+
 @pytest.fixture
 def client():
     def _override_get_db():

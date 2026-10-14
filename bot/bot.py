@@ -20,6 +20,13 @@ BOT_JOIN_MODE (run mode only), default "signed_in":
     option; not the default while it's blocked.
 Either way the bot pool still gates concurrency (one container per
 meeting); only the browser profile differs.
+
+BOT_MODE=health_check: one-shot, launched weekly by the scheduler
+(scheduler/health_check.py) for a single currently-idle account (via
+BOT_ACCOUNT_ID) — opens that account's saved profile, checks it's still
+signed in to Google, and writes the result onto bot_accounts
+(last_health_check_at / needs_relogin) so a silently-expired session is
+caught before a real meeting fails to join.
 """
 import json
 import os
@@ -37,12 +44,13 @@ from pathlib import Path
 
 import yaml
 from playwright.sync_api import sync_playwright
+from sqlalchemy import select
 
 from bot_pool.service import checkout_or_mark_unavailable, heartbeat, release_account
 from common.config import Settings, get_settings
 from common.db import SessionLocal
 from common.logging import configure_logging, get_logger
-from common.models import Meeting, MeetingStatus
+from common.models import BotAccount, BotAccountStatus, Meeting, MeetingStatus
 from common.queue import enqueue_processing
 from common.storage import StorageClient
 
@@ -122,6 +130,59 @@ def _now_naive_utc() -> datetime:
 
 def _json_line(obj: dict) -> str:
     return json.dumps(obj) + "\n"
+
+
+# --- profile lock hygiene ----------------------------------------------------
+# Confirmed live: notetaker1's profile had a stale SingletonLock from an old
+# login-mode container that didn't exit cleanly ("profile in use by another
+# Chromium process on another computer <hostname>"), which made the NEXT
+# launch against that profile (a health check) hang for the full 180s
+# timeout instead of just failing fast. Chromium writes SingletonLock /
+# SingletonCookie / SingletonSocket into a profile dir for as long as it
+# believes a browser process owns it, and only removes them on a clean exit
+# — a SIGKILL, an OOM, or a crashed container all skip that cleanup.
+
+SINGLETON_LOCK_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+
+
+def _remove_singleton_lock_files(profile_path: str) -> list[str]:
+    """Pure file removal, no ownership check — callers decide first whether
+    it's actually safe (see _clear_stale_profile_lock and its call sites).
+    Never raises; returns the names actually removed (empty if there was
+    nothing there)."""
+    removed = []
+    profile_dir = Path(profile_path)
+    for name in SINGLETON_LOCK_FILES:
+        f = profile_dir / name
+        try:
+            if f.exists() or f.is_symlink():
+                f.unlink()
+                removed.append(name)
+        except Exception:
+            logger.warning("stale_profile_lock_clear_failed", profile_path=profile_path, file=name, exc_info=True)
+    return removed
+
+
+def _clear_stale_profile_lock(profile_path: str) -> None:
+    """Call only once the caller has already established it's safe — i.e.
+    the bot pool's own in_use status (the source of truth for who's
+    legitimately allowed to hold a given profile right now) says nobody
+    else should be. Logs stale_profile_lock_cleared; a silent no-op if
+    there was nothing to clean up."""
+    removed = _remove_singleton_lock_files(profile_path)
+    if removed:
+        logger.info("stale_profile_lock_cleared", profile_path=profile_path, files=removed)
+
+
+def _clear_stale_profile_lock_for_account(db, account: "BotAccount") -> None:
+    """For callers (login mode, health check) that aren't themselves the
+    result of a fresh pool checkout — re-reads the account's current
+    status and only clears if it's not legitimately in_use right now. Safe
+    to call unconditionally; a genuinely in-use account is left alone."""
+    db.refresh(account)
+    if account.status == BotAccountStatus.IN_USE:
+        return
+    _clear_stale_profile_lock(account.profile_path)
 
 
 # --- audio recording -------------------------------------------------------
@@ -227,6 +288,19 @@ def run_login_mode(settings: Settings) -> None:
     """
     profile_path = os.environ["BOT_PROFILE_PATH"]
 
+    # No BOT_ACCOUNT_ID is passed to login mode (it's run by hand against a
+    # profile path, not dispatched by the pool) — look the account up by
+    # profile_path instead so the in_use check still has something to go
+    # on. No matching row (e.g. an ad-hoc profile never added to the pool)
+    # is treated the same as "not in_use": safe to clear.
+    db = SessionLocal()
+    account = db.scalars(select(BotAccount).where(BotAccount.profile_path == profile_path)).first()
+    if account is not None:
+        _clear_stale_profile_lock_for_account(db, account)
+    else:
+        _clear_stale_profile_lock(profile_path)
+    db.close()
+
     with sync_playwright() as pw:
         chromium_path = pw.chromium.executable_path
 
@@ -259,7 +333,190 @@ def run_login_mode(settings: Settings) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
 
+    # proc.wait() above guarantees the process is actually gone by this
+    # point either way — but if it didn't exit within the 10s grace period
+    # and had to be SIGKILLed, Chromium never got the chance to clean up
+    # its own SingletonLock (that's exactly the kind of unclean shutdown
+    # that left notetaker1's stale lock in the first place). Clear it
+    # ourselves now that we know for certain nothing is still holding it.
+    _remove_singleton_lock_files(profile_path)
     logger.info("login_mode_stopped_profile_saved")
+
+
+# --- health check mode --------------------------------------------------------
+
+
+def _account_is_signed_in(page) -> bool:
+    """True if this account's saved profile still has an authenticated
+    Google session — an unauthenticated one gets redirected to Google's own
+    sign-in interstitial, the same signal _detect_screen uses for the
+    pre-join flow. Never raises; a page without a readable .url is treated
+    as not signed in (conservative — triggers a visible alert rather than
+    silently assuming the account is fine)."""
+    try:
+        url = page.url
+    except Exception:
+        return False
+    return "accounts.google.com" not in url
+
+
+def _save_health_check_debug_screenshot(settings: Settings, page, account_id: uuid.UUID) -> None:
+    """Best-effort, never raises. Local-only is fine here (unlike
+    _save_debug_artifacts for a meeting) — this is a rare diagnostic for a
+    human investigating a specific account, not a per-meeting artifact
+    anyone else's pipeline depends on."""
+    try:
+        debug_dir = Path(settings.recordings_dir) / "health_checks" / str(account_id)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        path = debug_dir / f"inconclusive_{_now_naive_utc().strftime('%Y%m%dT%H%M%S')}.png"
+        page.screenshot(path=str(path), full_page=True, timeout=10000)
+        logger.info("health_check_debug_screenshot_saved", account_id=str(account_id), path=str(path))
+    except Exception:
+        logger.warning("health_check_debug_screenshot_failed", account_id=str(account_id), exc_info=True)
+
+
+def _resolve_health_check_account(db) -> "BotAccount | None":
+    """BOT_ACCOUNT_ID is what the scheduler passes (see
+    scheduler/bot_launcher.py's _health_check_environment); BOT_ACCOUNT_EMAIL
+    is accepted too so a human can run `docker compose run --rm -e
+    BOT_MODE=health_check -e BOT_ACCOUNT_EMAIL=... bot` by hand without
+    having to look up a UUID first (see README)."""
+    account_id_raw = os.environ.get("BOT_ACCOUNT_ID")
+    if account_id_raw:
+        return db.get(BotAccount, uuid.UUID(account_id_raw))
+    account_email = os.environ.get("BOT_ACCOUNT_EMAIL")
+    if account_email:
+        return db.scalars(select(BotAccount).where(BotAccount.email == account_email)).first()
+    raise RuntimeError("health_check mode needs BOT_ACCOUNT_ID or BOT_ACCOUNT_EMAIL set")
+
+
+def run_health_check_mode(settings: Settings) -> None:
+    """One-shot: launched by the scheduler's weekly health-check loop
+    (scheduler/health_check.py) for a single currently-*idle* account, via
+    BOT_ACCOUNT_ID (or BOT_ACCOUNT_EMAIL for a manual run — see README).
+    Opens that account's saved profile, checks whether it's still signed in
+    to Google, writes the result onto bot_accounts (last_health_check_at,
+    needs_relogin), and exits.
+
+    Unlike run_login_mode, this uses Playwright normally — the thing that
+    makes Google's automation fingerprinting block run_login_mode is
+    actively *signing in* (typing credentials) under CDP; here there's no
+    credential entry at all, just an already-authenticated profile loading
+    a page, the same "already-authenticated session being driven" case
+    run_login_mode's own docstring already calls out as fine. Still reduces
+    automation signals the same way run_bot_mode does, since it's a real
+    pool account's live session — no sense treating it more carelessly
+    just because no meeting is involved.
+
+    The actual check runs in a background thread joined with a hard
+    bot_health_check_run_timeout_seconds ceiling (default 90s) — confirmed
+    live that a stale profile lock can otherwise hang the whole thing far
+    longer with nothing to show for it (see _clear_stale_profile_lock_*).
+    A stuck thread is simply abandoned (daemon=True — the process exits
+    under it) rather than joined forever.
+
+    Never raises past this function — a failed or timed-out check is
+    logged and treated as inconclusive (keeps the account's previous
+    needs_relogin value rather than guessing), since this runs unattended
+    on a schedule and a transient failure (network blip, Meet UI hiccup)
+    shouldn't flip an alert flag."""
+    db = SessionLocal()
+    try:
+        account = _resolve_health_check_account(db)
+    except RuntimeError as exc:
+        logger.error("health_check_missing_account_selector", error=str(exc))
+        db.close()
+        return
+    if account is None:
+        logger.error(
+            "health_check_account_not_found",
+            account_id=os.environ.get("BOT_ACCOUNT_ID"),
+            email=os.environ.get("BOT_ACCOUNT_EMAIL"),
+        )
+        db.close()
+        return
+
+    account_id = account.id
+    logger.info("bot_account_health_check_starting", account_id=str(account_id), email=account.email)
+    _clear_stale_profile_lock_for_account(db, account)
+
+    result = {"needs_relogin": account.needs_relogin}
+
+    def _do_check() -> None:
+        try:
+            logger.info("bot_account_health_check_step", account_id=str(account_id), step="launching_chromium")
+            with sync_playwright() as pw:
+                context = pw.chromium.launch_persistent_context(
+                    account.profile_path,
+                    headless=False,
+                    locale="en-US",
+                    args=[
+                        "--start-maximized",
+                        DISABLE_DEV_SHM_ARG,
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                    ignore_default_args=["--enable-automation"],
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = None
+                try:
+                    page = context.new_page()
+                    logger.info("bot_account_health_check_step", account_id=str(account_id), step="navigating")
+                    page.goto("https://myaccount.google.com/", wait_until="load", timeout=30000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    logger.info(
+                        "bot_account_health_check_step", account_id=str(account_id), step="checking_signed_in"
+                    )
+                    signed_in = _account_is_signed_in(page)
+                    result["needs_relogin"] = not signed_in
+                    logger.info(
+                        "bot_account_health_check_result",
+                        account_id=str(account_id),
+                        email=account.email,
+                        signed_in=signed_in,
+                        url=page.url,
+                    )
+                except Exception:
+                    logger.error("bot_account_health_check_failed", account_id=str(account_id), exc_info=True)
+                    if page is not None:
+                        _save_health_check_debug_screenshot(settings, page, account_id)
+                finally:
+                    try:
+                        context.close()
+                    except Exception:
+                        logger.warning(
+                            "health_check_context_close_failed", account_id=str(account_id), exc_info=True
+                        )
+        except Exception:
+            # Failed before/without ever getting a page open (e.g. Chromium
+            # itself wouldn't launch) — nothing to screenshot.
+            logger.error("bot_account_health_check_failed", account_id=str(account_id), exc_info=True)
+
+    thread = threading.Thread(target=_do_check, daemon=True, name="health-check")
+    thread.start()
+    thread.join(timeout=settings.bot_health_check_run_timeout_seconds)
+    if thread.is_alive():
+        logger.error(
+            "bot_account_health_check_timed_out",
+            account_id=str(account_id),
+            timeout_seconds=settings.bot_health_check_run_timeout_seconds,
+        )
+
+    account.last_health_check_at = _now_naive_utc()
+    account.needs_relogin = result["needs_relogin"]
+    db.commit()
+
+    if result["needs_relogin"]:
+        logger.warning(
+            "bot_account_needs_relogin",
+            account_id=str(account_id),
+            email=account.email,
+            hint="run BOT_MODE=login against this account's profile to re-authenticate",
+        )
+    db.close()
 
 
 # --- run mode: join flow -----------------------------------------------------
@@ -1005,6 +1262,10 @@ def run_bot_mode(settings: Settings) -> None:
         profile_dir = temp_profile_dir
     else:
         profile_dir = account.profile_path
+        # Safe unconditionally here: checkout_or_mark_unavailable just
+        # claimed this account exclusively (row-locked), so any lock file
+        # already in its profile dir predates that claim and is stale.
+        _clear_stale_profile_lock(profile_dir)
 
     logger.info(
         "bot_starting", meeting_id=str(meeting_id), account_email=account.email, join_mode=join_mode
@@ -1166,6 +1427,8 @@ def main() -> None:
         run_login_mode(settings)
     elif mode == "run":
         run_bot_mode(settings)
+    elif mode == "health_check":
+        run_health_check_mode(settings)
     else:
         print(f"unknown BOT_MODE: {mode}", file=sys.stderr)
         sys.exit(1)
